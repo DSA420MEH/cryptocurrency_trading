@@ -1,0 +1,377 @@
+//@version=6
+indicator("Gann Cipher Fusion [Antigravity]", shorttitle="GCF_Fusion", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+
+// =============================================================================
+// 0. CORE DATA ENGINE & TYPES
+// =============================================================================
+
+// --- Types ---
+type Anchor
+    float price
+    int t
+    bool isHigh
+
+type FanLine
+    line l1
+    line l2
+    line l3
+
+// --- Inputs ---
+grp_src     = "Data Source"
+src         = input.source(hlc3, "Wave Source", group=grp_src)
+src_close   = input.source(close, "Flow/RSI Source", group=grp_src)
+
+grp_gann    = "Gann Geometry"
+gann_len      = input.int(10, "Pivot Lookback", minval=2, maxval=50, group=grp_gann, tooltip="Higher values = stronger pivots but more lag")
+gann_slope    = input.float(1.0, "Slope Multiplier", step=0.1, minval=0.1, maxval=5.0, group=grp_gann)
+gann_tolerance = input.float(0.5, "Fan Tolerance %", minval=0.1, maxval=5.0, step=0.1, group=grp_gann, tooltip="Distance threshold for fan line interactions")
+fan_len       = input.int(300, "Fan Length (Bars)", minval=50, maxval=1000, group=grp_gann)
+
+grp_cipher  = "Cipher Settings"
+wt_len1     = input.int(9, "WT Channel Length", group=grp_cipher)
+wt_len2     = input.int(12, "WT Average Length", group=grp_cipher)
+wt_smooth   = input.int(3, "WT Smoothing", group=grp_cipher)
+wt_ob       = input.int(53, "WT Overbought", minval=0, group=grp_cipher)
+wt_os       = input.int(-53, "WT Oversold", maxval=0, group=grp_cipher)
+rsi_len     = input.int(14, "RSI Length", group=grp_cipher)
+rsi_ob      = input.int(70, "RSI Overbought", minval=50, maxval=100, group=grp_cipher)
+rsi_os      = input.int(30, "RSI Oversold", minval=0, maxval=50, group=grp_cipher)
+
+grp_flow    = "Flow Settings"
+show_ribbon = input.bool(true, "Show Ribbon", group=grp_flow)
+show_cloud  = input.bool(true, "Show Cloud", group=grp_flow)
+
+// --- Constants ---
+color C_BULL_MAIN = #00ff00
+color C_BULL_SEC  = #1573d4
+color C_BEAR_MAIN = #ff0000
+color C_BEAR_SEC  = #ff6600
+color C_NEUTRAL   = #ffff00
+color C_BG        = #363a45
+
+// =============================================================================
+// 1. CALCULATION KERNELS
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1.1 Cipher Wave Kernel (Momentum)
+// -----------------------------------------------------------------------------
+f_wavetrend(_src, _chlen, _avg, _smth) =>
+    _esa = ta.ema(_src, _chlen)
+    _de  = ta.ema(math.abs(_src - _esa), _chlen)
+    _ci  = (_src - _esa) / (0.015 * math.max(_de, 0.000001))  // Protection against division by zero
+    _tci = ta.ema(_ci, _avg)
+    _wt1 = _tci
+    _wt2 = ta.sma(_wt1, _smth)
+    [_wt1, _wt2]
+
+[wt1, wt2] = f_wavetrend(src, wt_len1, wt_len2, wt_smooth)
+rsi_val    = ta.rsi(src_close, rsi_len)
+atr14      = ta.atr(14)  // Calculate once for consistency
+
+// Wave State Logic (with RSI integration)
+wave_bull = ta.crossover(wt1, wt2) or (wt2 < wt_os and wt1 > wt2 and rsi_val < rsi_os)
+wave_bear = ta.crossunder(wt1, wt2) or (wt2 > wt_ob and wt1 < wt2 and rsi_val > rsi_ob)
+
+// -----------------------------------------------------------------------------
+// 1.2 Cipher Flow Kernel (Trend)
+// -----------------------------------------------------------------------------
+// Ribbon EMAs (only calculate what we use)
+ema1 = ta.ema(src_close, 5)
+ema2 = ta.ema(src_close, 11)
+ema8 = ta.ema(src_close, 34)
+
+// Cloud EMAs
+cloud_fast = ta.ema(src_close, 55)
+cloud_slow = ta.ema(src_close, 200)
+
+// Flow State Logic
+ribbon_bull = ema2 > ema8
+ribbon_bear = ema2 < ema8
+cloud_bull  = src_close > cloud_fast and cloud_fast > cloud_slow
+cloud_bear  = src_close < cloud_fast and cloud_fast < cloud_slow
+
+flow_bull = ribbon_bull and cloud_bull
+flow_bear = ribbon_bear and cloud_bear
+
+// -----------------------------------------------------------------------------
+// 1.3 Gann Geometry Kernel (Non-Repainting)
+// -----------------------------------------------------------------------------
+// Storage
+var Anchor[] anchors_low = array.new<Anchor>()
+var Anchor[] anchors_high = array.new<Anchor>()
+var FanLine[] fans_low = array.new<FanLine>()
+var FanLine[] fans_high = array.new<FanLine>()
+
+// Pivot Detection (Confirmed Bars Only)
+// We look at bar_index[gann_len] to see if it was a pivot
+// This introduces lag but ensures ZERO repainting
+pivot_l = ta.pivotlow(src, gann_len, gann_len)
+pivot_h = ta.pivothigh(src, gann_len, gann_len)
+
+// Helper to manage array size
+f_manage_anchors(_arr, _max) =>
+    if array.size(_arr) > _max
+        array.shift(_arr)
+
+// Helper to draw fans
+f_draw_fan(_anchor, _slope, _dir, _col) =>
+    // Calculate end time properly (convert bars to milliseconds)
+    _end_time = _anchor.t + (fan_len * timeframe.in_seconds(timeframe.period) * 1000)
+    
+    // Calculate end point
+    _y2_1x = _anchor.price + (_slope * 1.0 * _dir * fan_len)
+    _y2_2x = _anchor.price + (_slope * 2.0 * _dir * fan_len)
+    _y2_05x = _anchor.price + (_slope * 0.5 * _dir * fan_len)
+    
+    _l1 = line.new(_anchor.t, _anchor.price, _end_time, _y2_1x, xloc=xloc.bar_time, color=_col, style=line.style_solid)
+    _l2 = line.new(_anchor.t, _anchor.price, _end_time, _y2_2x, xloc=xloc.bar_time, color=color.new(_col, 50), style=line.style_solid)
+    _l3 = line.new(_anchor.t, _anchor.price, _end_time, _y2_05x, xloc=xloc.bar_time, color=color.new(_col, 50), style=line.style_solid)
+    
+    FanLine.new(_l1, _l2, _l3)
+
+// Process New Pivots
+if not na(pivot_l)
+    // Found a confirmed low pivot 'gann_len' bars ago
+    // Calculate slope based on ATR at that time
+    _atr = atr14[gann_len]
+    _slope = (_atr / 10.0) * gann_slope // Simple ATR-based slope normalization
+    
+    _a = Anchor.new(pivot_l, time[gann_len], false)
+    array.push(anchors_low, _a)
+    f_manage_anchors(anchors_low, 10)
+    
+    // Draw Fan
+    _f = f_draw_fan(_a, _slope, 1, C_BULL_MAIN)
+    array.push(fans_low, _f)
+    // Prune old fans (Strict Performance Budget: Max 50 lines total)
+    if array.size(fans_low) > 5
+        _old = array.shift(fans_low)
+        line.delete(_old.l1)
+        line.delete(_old.l2)
+        line.delete(_old.l3)
+
+if not na(pivot_h)
+    // Found a confirmed high pivot
+    _atr = atr14[gann_len]
+    _slope = (_atr / 10.0) * gann_slope
+    
+    _a = Anchor.new(pivot_h, time[gann_len], true)
+    array.push(anchors_high, _a)
+    f_manage_anchors(anchors_high, 10)
+    
+    // Draw Fan
+    _f = f_draw_fan(_a, _slope, -1, C_BEAR_MAIN)
+    array.push(fans_high, _f)
+    if array.size(fans_high) > 5
+        _old = array.shift(fans_high)
+        line.delete(_old.l1)
+        line.delete(_old.l2)
+        line.delete(_old.l3)
+
+// Gann State Logic (Fan Line Intersection Detection)
+// Check if current price is interacting with any active fan line
+gann_bull = false
+gann_bear = false
+
+// Convert tolerance to decimal
+float tolerance = gann_tolerance / 100
+
+// Helper function to calculate fan line price at current bar
+f_calc_fan_price(_anchor, _slope, _dir) =>
+    _bars_from_anchor = (time - _anchor.t) / (timeframe.in_seconds(timeframe.period) * 1000)
+    _anchor.price + (_slope * _dir * _bars_from_anchor)
+
+// Check bullish fans (support bounces)
+if array.size(anchors_low) > 0
+    for i = 0 to math.min(array.size(anchors_low) - 1, 2)  // Check last 3 anchors only
+        _anchor = array.get(anchors_low, array.size(anchors_low) - 1 - i)
+        _atr = atr14
+        _slope = (_atr / 10.0) * gann_slope
+        
+        // Calculate 1x fan line price at current bar
+        _fan_price = f_calc_fan_price(_anchor, _slope, 1)
+        
+        // Check if price is near the fan line
+        if math.abs(close - _fan_price) / close < tolerance
+            // Check if we're bouncing (low touched, close above)
+            if low <= _fan_price and close > _fan_price
+                gann_bull := true
+                break
+
+// Check bearish fans (resistance rejections)
+if array.size(anchors_high) > 0
+    for i = 0 to math.min(array.size(anchors_high) - 1, 2)
+        _anchor = array.get(anchors_high, array.size(anchors_high) - 1 - i)
+        _atr = atr14
+        _slope = (_atr / 10.0) * gann_slope
+        
+        // Calculate 1x fan line price at current bar
+        _fan_price = f_calc_fan_price(_anchor, _slope, -1)
+        
+        // Check if price is near the fan line
+        if math.abs(close - _fan_price) / close < tolerance
+            // Check if we're rejecting (high touched, close below)
+            if high >= _fan_price and close < _fan_price
+                gann_bear := true
+                break
+
+
+// -----------------------------------------------------------------------------
+// 1.4 Volume Profile Kernel (Simplified Rolling Window)
+// -----------------------------------------------------------------------------
+// Rolling VP logic to be implemented in next phase
+vp_bull = close > ta.vwap // Simple placeholder using VWAP for now
+vp_bear = close < ta.vwap
+
+// =============================================================================
+// 2. LOGIC & SIGNAL ENGINE (Layer 2)
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 2.1 Signal Normalizer & State Definition
+// -----------------------------------------------------------------------------
+// Wave State (+1 Bull, -1 Bear, 0 Neutral)
+int s_wave = 0
+if wave_bull
+    s_wave := 1
+else if wave_bear
+    s_wave := -1
+else
+    // Check zones if no cross (using configurable thresholds)
+    if wt2 < wt_os and rsi_val < rsi_os
+        s_wave := 1 // Oversold bias
+    else if wt2 > wt_ob and rsi_val > rsi_ob
+        s_wave := -1 // Overbought bias
+
+// Flow State (+1 Bull, -1 Bear, 0 Neutral)
+int s_flow = 0
+if flow_bull
+    s_flow := 1
+else if flow_bear
+    s_flow := -1
+
+// Gann State (+1 Bull, -1 Bear, 0 Neutral)
+int s_gann = 0
+if gann_bull
+    s_gann := 1
+else if gann_bear
+    s_gann := -1
+
+// VP State (+1 Bull, -1 Bear, 0 Neutral)
+int s_vp = 0
+if vp_bull
+    s_vp := 1
+else if vp_bear
+    s_vp := -1
+
+// -----------------------------------------------------------------------------
+// 2.2 Confluence Scorer (Fusion Logic Spec)
+// -----------------------------------------------------------------------------
+// Weights: Wave=0.4, Flow=0.3, Gann=0.2, VP=0.1
+float score = (s_wave * 0.4) + (s_flow * 0.3) + (s_gann * 0.2) + (s_vp * 0.1)
+
+// -----------------------------------------------------------------------------
+// 2.3 Signal Tiers & Thresholds
+// -----------------------------------------------------------------------------
+// Thresholds
+float TH_GOD  = 0.8
+float TH_HIGH = 0.6
+
+// Tier 1: God Mode (|Score| >= 0.8)
+bool sig_god_bull = score >= TH_GOD
+bool sig_god_bear = score <= -TH_GOD
+
+// Tier 2: High Confluence (0.6 <= |Score| < 0.8)
+bool sig_high_bull = score >= TH_HIGH and score < TH_GOD
+bool sig_high_bear = score <= -TH_HIGH and score > -TH_GOD
+
+// Tie-Break Rules (Flow Filter)
+// If Flow is Bullish, ignore Bearish signals (unless God Mode reversal)
+if s_flow == 1
+    sig_high_bear := false
+    // God Mode Reversal allowed if score is extreme (>0.9) - strict filter
+    if score > -0.9
+        sig_god_bear := false
+
+if s_flow == -1
+    sig_high_bull := false
+    if score < 0.9
+        sig_god_bull := false
+
+// =============================================================================
+// 3. VISUALIZATION & ALERTS (Layer 3)
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 3.1 EMA Ribbon & Cloud Visualization
+// -----------------------------------------------------------------------------
+// Plot Ribbon (optional display)
+plot(show_ribbon ? ema1 : na, "EMA 1", color=color.new(C_BULL_SEC, 70), linewidth=1)
+plot(show_ribbon ? ema2 : na, "EMA 2", color=color.new(C_BULL_SEC, 60), linewidth=1)
+plot(show_ribbon ? ema8 : na, "EMA 8", color=color.new(C_BEAR_MAIN, 60), linewidth=1)
+
+// Ribbon Fill
+p1 = plot(show_ribbon ? ema1 : na, display=display.none)
+p8 = plot(show_ribbon ? ema8 : na, display=display.none)
+fill(p1, p8, color=ribbon_bull ? color.new(C_BULL_SEC, 85) : color.new(C_BEAR_SEC, 85))
+
+// Plot Cloud
+plot(show_cloud ? cloud_fast : na, "Cloud Fast (55)", color=color.new(C_BULL_MAIN, 50), linewidth=2)
+plot(show_cloud ? cloud_slow : na, "Cloud Slow (200)", color=color.new(C_BEAR_MAIN, 50), linewidth=2)
+
+// Cloud Fill
+pfast = plot(show_cloud ? cloud_fast : na, display=display.none)
+pslow = plot(show_cloud ? cloud_slow : na, display=display.none)
+fill(pfast, pslow, color=cloud_bull ? color.new(C_BULL_MAIN, 92) : color.new(C_BEAR_MAIN, 92))
+
+// -----------------------------------------------------------------------------
+// 3.2 Signal Shapes
+// -----------------------------------------------------------------------------
+plotshape(sig_god_bull, "God Mode Bull", shape.diamond, location.belowbar, C_BULL_MAIN, size=size.small, text="GOD")
+plotshape(sig_god_bear, "God Mode Bear", shape.diamond, location.abovebar, C_BEAR_MAIN, size=size.small, text="GOD")
+
+plotshape(sig_high_bull, "High Conf Bull", shape.triangleup, location.belowbar, C_BULL_SEC, size=size.tiny)
+plotshape(sig_high_bear, "High Conf Bear", shape.triangledown, location.abovebar, C_BEAR_SEC, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// 3.3 Dashboard
+// -----------------------------------------------------------------------------
+show_dash = input.bool(true, "Show Dashboard", group="Visuals")
+var table dash = table.new(position.bottom_right, 2, 5, border_width=1)
+
+if show_dash and barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "Gann Cipher Fusion", bgcolor=C_BG, text_color=color.white)
+    table.cell(dash, 1, 0, "", bgcolor=C_BG)
+    
+    // Trend Bias
+    color bias_col = s_flow == 1 ? C_BULL_MAIN : s_flow == -1 ? C_BEAR_MAIN : C_NEUTRAL
+    string bias_txt = s_flow == 1 ? "BULLISH" : s_flow == -1 ? "BEARISH" : "NEUTRAL"
+    table.cell(dash, 0, 1, "Trend", bgcolor=C_BG, text_color=color.gray)
+    table.cell(dash, 1, 1, bias_txt, bgcolor=bias_col, text_color=color.black)
+    
+    // Confluence Score
+    color score_col = score > 0 ? color.new(C_BULL_MAIN, 60) : score < 0 ? color.new(C_BEAR_MAIN, 60) : color.gray
+    table.cell(dash, 0, 2, "Score", bgcolor=C_BG, text_color=color.gray)
+    table.cell(dash, 1, 2, str.tostring(score, "#.##"), bgcolor=score_col, text_color=color.white)
+    
+    // Signal Status
+    string sig_txt = sig_god_bull ? "GOD BULL" : sig_god_bear ? "GOD BEAR" : sig_high_bull ? "HIGH BULL" : sig_high_bear ? "HIGH BEAR" : "WAIT"
+    color sig_col = sig_god_bull or sig_high_bull ? C_BULL_MAIN : sig_god_bear or sig_high_bear ? C_BEAR_MAIN : color.gray
+    table.cell(dash, 0, 3, "Status", bgcolor=C_BG, text_color=color.gray)
+    table.cell(dash, 1, 3, sig_txt, bgcolor=sig_col, text_color=color.white)
+    
+    // Component States
+    string comp = "W:" + str.tostring(s_wave) + " F:" + str.tostring(s_flow) + " G:" + str.tostring(s_gann) + " V:" + str.tostring(s_vp)
+    table.cell(dash, 0, 4, "Components", bgcolor=C_BG, text_color=color.gray)
+    table.cell(dash, 1, 4, comp, bgcolor=C_BG, text_color=color.white)
+
+// -----------------------------------------------------------------------------
+// 3.4 Alerts
+// -----------------------------------------------------------------------------
+alertcondition(sig_god_bull, "God Mode Bull", "🔥 GOD MODE BULL Signal!")
+alertcondition(sig_god_bear, "God Mode Bear", "🔥 GOD MODE BEAR Signal!")
+alertcondition(sig_high_bull, "High Conf Bull", "✅ High Confluence Bull Signal")
+alertcondition(sig_high_bear, "High Conf Bear", "✅ High Confluence Bear Signal")
+

@@ -1,0 +1,184 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © vumanchu
+//@version=6
+
+// Cipher A Version 2 - Refactored and Optimized
+// Original by VuManChu, based on FalconCoin's Market Cipher A
+// Refactored by Antigravity
+
+indicator(title="Cipher A v2", shorttitle="Cipher_A_v2", overlay=true, max_lines_count = 500, max_labels_count = 500)
+
+// FUNCTIONS {
+
+// WaveTrend
+f_wavetrend(_src, _chlen, _avg, _malen) =>
+    _esa = ta.ema(_src, _chlen)
+    _de = ta.ema(math.abs(_src - _esa), _chlen)
+    _ci = (_src - _esa) / (0.015 * _de)
+    _tci = ta.ema(_ci, _avg)
+    _wt1 = _tci
+    _wt2 = ta.sma(_wt1, _malen)
+    [_wt1, _wt2]
+
+// 8 EMA Ribbon
+f_emaRibbon(_src, _e1, _e2, _e3, _e4, _e5, _e6, _e7, _e8) =>
+    _ema1 = ta.ema(_src, _e1)
+    _ema2 = ta.ema(_src, _e2)
+    _ema3 = ta.ema(_src, _e3)
+    _ema4 = ta.ema(_src, _e4)
+    _ema5 = ta.ema(_src, _e5)
+    _ema6 = ta.ema(_src, _e6)
+    _ema7 = ta.ema(_src, _e7)
+    _ema8 = ta.ema(_src, _e8)
+    [_ema1, _ema2, _ema3, _ema4, _ema5, _ema6, _ema7, _ema8]
+    
+// RSI+MFI (Optimized: Direct calculation)
+f_rsimfi(_period, _multiplier) => 
+    ta.sma(((close - open) / (high - low)) * _multiplier, _period)
+
+// } FUNCTIONS  
+
+
+// PARAMETERS {
+
+// WaveTrend
+group_wt = "WaveTrend"
+wtChannelLen = input.int(9, title = 'Channel Length', group=group_wt)
+wtAverageLen = input.int(13, title = 'Average Length', group=group_wt)
+wtMASource = input.source(hlc3, title = 'MA Source', group=group_wt)
+wtMALen = input.int(3, title = 'MA Length', group=group_wt)
+obLevel = input.int(53, title = 'Overbought Level', group=group_wt)
+osLevel = input.int(-53, title = 'Oversold Level', group=group_wt)
+showWtState = input.bool(true, title = "Show WT State (Background)", group=group_wt)
+
+// EMA Ribbon
+group_ribbon = "EMA Ribbon"
+showRibbon = input.bool(false, "Show Ribbon", group=group_ribbon)
+ema1Len = input.int(5, title = "EMA 1 Length", group=group_ribbon)
+ema2Len = input.int(11, title = "EMA 2 Length", group=group_ribbon)
+ema3Len = input.int(15, title = "EMA 3 Length", group=group_ribbon)
+ema4Len = input.int(18, title = "EMA 4 Length", group=group_ribbon)
+ema5Len = input.int(21, title = "EMA 5 Length", group=group_ribbon)
+ema6Len = input.int(24, title = "EMA 6 Length", group=group_ribbon)
+ema7Len = input.int(28, title = "EMA 7 Length", group=group_ribbon)
+ema8Len = input.int(34, title = "EMA 8 Length", group=group_ribbon)
+
+// RSI
+group_rsi = "RSI"
+rsiSRC = input.source(close, title = "Source", group=group_rsi)
+rsiLen = input.int(7, title = "Length", group=group_rsi)
+
+// RSI+MFI
+group_rsimfi = "RSI+MFI"
+rsiMFIShow = input.bool(true, title = "Show RSI+MFI State", group=group_rsimfi)
+rsiMFIperiod = input.int(60, title = 'Period', group=group_rsimfi)
+rsiMFIMultiplier = input.int(150, title = 'Area Multiplier', group=group_rsimfi)
+
+// Yellow Cross Thresholds
+group_yc = "Yellow Cross Settings"
+yc_wt2_upper = input.int(45, title="WT2 Upper Limit", group=group_yc)
+yc_wt2_lower = input.int(-80, title="WT2 Lower Limit", group=group_yc)
+yc_rsi_upper = input.int(30, title="RSI Upper Limit", group=group_yc)
+yc_rsi_lower = input.int(15, title="RSI Lower Limit", group=group_yc)
+yc_rsimfi_upper = input.int(-5, title="RSI+MFI Upper Limit", group=group_yc)
+
+// }
+
+
+// CALCULATE INDICATORS {
+
+// EMA Ribbon
+[ema1, ema2, ema3, ema4, ema5, ema6, ema7, ema8] = f_emaRibbon(close, ema1Len, ema2Len, ema3Len, ema4Len, ema5Len, ema6Len, ema7Len, ema8Len)
+
+// RSI 
+rsi = ta.rsi(rsiSRC, rsiLen)
+
+// Calculates WaveTrend
+[wt1, wt2] = f_wavetrend(wtMASource, wtChannelLen, wtAverageLen, wtMALen)
+
+// WaveTrend Conditions
+wtOverSold = wt2 <= osLevel
+wtOverBought = wt2 >= obLevel
+wtCross = ta.cross(wt1, wt2)
+wtCrossUp = wt2 - wt1 <= 0
+wtCrossDown = wt2 - wt1 >= 0
+
+// RSI + MFI
+rsiMFI = f_rsimfi(rsiMFIperiod, rsiMFIMultiplier)
+
+// Signals
+longEma = ta.crossover(ema2, ema8)
+redCross = ta.crossunder(ema1, ema2)
+blueTriangle = ta.crossover(ema2, ema3)
+redDiamond = wtCross and wtCrossDown
+// Parameterized Yellow Cross
+yellowCross = redDiamond and wt2 < yc_wt2_upper and wt2 > yc_wt2_lower and rsi < yc_rsi_upper and rsi > yc_rsi_lower and rsiMFI < yc_rsimfi_upper
+bloodDiamond = redDiamond and redCross
+bullCandle = open > ema2 and open > ema8 and (close[1] > open[1]) and (close > open) and not redDiamond and not redCross
+shortEma = ta.crossover(ema8, ema2)
+
+// } CALCULATE INDICATORS
+
+
+// DRAW {
+
+// EMA Ribbon
+ribbonDir = ema8 < ema2
+colorEma = ribbonDir ? color.green : color.red
+p1 = plot(ema1, color=showRibbon ? ribbonDir ? #1573d4 : #ef5350 : na, linewidth=1, title="EMA 1")
+p2 = plot(ema2, color=showRibbon ? ribbonDir ? #3096ff : #ef5350 : na, linewidth=1, title="EMA 2")
+plot(ema3, color=showRibbon ? ribbonDir ? #57abff : #ef5350 : na, linewidth=1, title="EMA 3")
+plot(ema4, color=showRibbon ? ribbonDir ? #85c2ff : #ef5350 : na, linewidth=1, title="EMA 4")
+plot(ema5, color=showRibbon ? ribbonDir ? color.yellow : color.yellow : na, linewidth=1, title="EMA 5")
+plot(ema6, color=showRibbon ? ribbonDir ? #b3d9ff : #ef5350 : na, linewidth=1, title="EMA 6")
+plot(ema7, color=showRibbon ? ribbonDir ? #c9e5ff : #ef5350 : na, linewidth=1, title="EMA 7")
+plot(ema8, color=showRibbon ? ribbonDir ? #dfecfb : #ef5350 : na, linewidth=1, title="EMA 8")
+p8 = plot(ema8, color=showRibbon ? na : colorEma, linewidth=2, title="EMA 8")
+fill(p1, p2, color = color.new(#1573d4, 90))
+fill(p2, p8, color = color.new(#363a45, 90))
+
+// WaveTrend State Background
+bgcolor(showWtState and wtOverBought ? color.new(color.red, 90) : na, title="WT Overbought Background")
+bgcolor(showWtState and wtOverSold ? color.new(color.green, 90) : na, title="WT Oversold Background")
+
+// RSI+MFI State (Visual)
+// Using a small bar color change or similar to indicate RSI+MFI extreme
+barcolor(rsiMFIShow and rsiMFI < yc_rsimfi_upper ? color.new(color.orange, 0) : na, title="RSI+MFI Low")
+
+
+// SHAPES
+// Adjusted locations to prevent overlap
+plotshape(longEma, style=shape.circle, color=#00ff00, location=location.abovebar, size=size.tiny, title="Long EMA Signal")
+plotshape(shortEma, style=shape.circle, color=#ff0000, location=location.abovebar, size=size.tiny, title="Short EMA Signal")
+plotshape(redCross, style=shape.xcross, color=#ff0000, location=location.abovebar, size=size.tiny, title="Red cross")
+plotshape(blueTriangle, style=shape.triangleup, color=#0064ff, location=location.abovebar, size=size.small, title="Blue Triangle")
+plotshape(redDiamond, style=shape.diamond, color=#ff0000, location=location.abovebar, size=size.tiny, title="Red Diamond")
+plotshape(bullCandle, style=shape.diamond, color=color.yellow, location=location.abovebar, size=size.tiny, title="Bull candle")
+plotshape(bloodDiamond, style=shape.diamond, color=#ff0000, location=location.abovebar, size=size.small, title="Blood Diamond")
+plotshape(yellowCross, style=shape.xcross, color=color.yellow, location=location.abovebar, size=size.small, title="Yellow Cross")
+// } DRAW
+  
+  
+// ALERTS {
+alertcondition(redDiamond, "Red Diamond", "Red Diamond")
+alertcondition(bloodDiamond, "Blood Diamond", "Blood Diamond")
+alertcondition(yellowCross, "YellowX", "YellowX")
+alertcondition(redCross, "RedX", "RedX")
+alertcondition(longEma, "Longema", "Longema")
+alertcondition(blueTriangle, "Bluetriangle", "Bluetriangle")
+alertcondition(bullCandle, "Bull Candle", "Bull Candle")
+alertcondition(shortEma, "Short EMA", "Short EMA")
+// } ALERTS
+
+// CLOUD EMAs
+// Reusing existing EMAs where possible or keeping separate if intended to be distinct.
+// Original code had M55, M21, M200. M21 is also EMA5 (len 21).
+// To be safe and follow blueprint "Cloud EMAs" section, I'll keep them but use the same variable names for clarity.
+M55=ta.ema(close, 55)
+M21=ta.ema(close, 21)
+M200=ta.ema(close, 200)
+
+PT1 = plot(M55,color=#02F539, linewidth=2, title="Cloud M55")
+PT2 = plot(M21,color=#FFF202, linewidth=2, title="Cloud M21")
+PT3 = plot(M200,color=#F50202, linewidth=2, title="Cloud M200")
+fill(PT1,PT3,color = color.new(#02F539, 90), title="Cloud Fill")

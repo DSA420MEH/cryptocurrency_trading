@@ -1,0 +1,306 @@
+//@version=6
+strategy("Next-Gen Hybrid: Adaptive Multi-Strategy [Antigravity]", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD, pyramiding=3)
+
+// =============================================================================
+// PRESET SYSTEM
+// =============================================================================
+
+preset = input.string("User Custom (Swing)", "📊 Strategy Preset", 
+     options=["User Custom (Swing)", "Optimized v2 (Swing)", "Intraday (1H-15m)"], 
+     group="🎯 Preset Selection",
+     tooltip="User Custom = Your proven 9-14 PF settings | Optimized v2 = Enhanced swing | Intraday = Fast parameters for <1H")
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// --- Module A: Regime Classifier ---
+grp_regime = "Module A: Regime Classifier"
+len_adx      = input.int(preset == "Optimized v2 (Swing)" ? 22 : preset == "Intraday (1H-15m)" ? 14 : 20, "ADX Length", minval=1, group=grp_regime)
+th_adx_trend = input.int(preset == "Optimized v2 (Swing)" ? 30 : preset == "Intraday (1H-15m)" ? 20 : 27, "ADX Trend Threshold", minval=1, group=grp_regime)
+len_ma_slope = input.int(preset == "Optimized v2 (Swing)" ? 50 : preset == "Intraday (1H-15m)" ? 50 : 52, "MA Slope Length", minval=1, group=grp_regime)
+th_ma_slope  = input.float(0.5, "MA Slope Threshold (deg)", group=grp_regime)
+len_chop     = input.int(preset == "Optimized v2 (Swing)" ? 7 : preset == "Intraday (1H-15m)" ? 10 : 7, "Choppiness Index Length", minval=1, group=grp_regime)
+th_chop_high = input.float(preset == "Optimized v2 (Swing)" ? 72.0 : preset == "Intraday (1H-15m)" ? 61.8 : 77.8, "Chop High (Range)", group=grp_regime)
+th_chop_low  = input.float(preset == "Optimized v2 (Swing)" ? 38.0 : preset == "Intraday (1H-15m)" ? 38.2 : 34.2, "Chop Low (Trend)", group=grp_regime)
+
+// --- Module B: Trend Engine ---
+grp_trend = "Module B: Trend Engine"
+len_trend_ma = input.int(preset == "Intraday (1H-15m)" ? 100 : 200, "Trend MA Length", minval=1, group=grp_trend)
+len_channel  = input.int(20, "Donchian Channel Length", minval=1, group=grp_trend)
+
+// --- Module C: Mean Reversion ---
+grp_rev = "Module C: Mean Reversion"
+len_bb      = input.int(20, "Bollinger Bands Length", minval=1, group=grp_rev)
+mult_bb     = input.float(2.0, "BB Multiplier", minval=0.1, group=grp_rev)
+len_rsi     = input.int(14, "RSI Length", minval=1, group=grp_rev)
+th_rsi_ob   = input.int(70, "RSI Overbought", minval=50, maxval=100, group=grp_rev)
+th_rsi_os   = input.int(30, "RSI Oversold", minval=0, maxval=50, group=grp_rev)
+
+// --- Module D: Risk & Volatility ---
+grp_risk = "Module D: Risk & Volatility"
+risk_per_trade = input.float(preset == "Intraday (1H-15m)" ? 1.0 : 1.4, "Risk Per Trade (%)", minval=0.1, step=0.1, group=grp_risk)
+atr_len        = input.int(preset == "Intraday (1H-15m)" ? 14 : 28, "ATR Length", minval=1, group=grp_risk)
+atr_mult_stop  = input.float(preset == "Intraday (1H-15m)" ? 1.5 : 2.0, "ATR Stop Multiplier", minval=0.5, step=0.1, group=grp_risk)
+tp_rr          = input.float(preset == "Optimized v2 (Swing)" ? 2.5 : preset == "Intraday (1H-15m)" ? 1.5 : 2.0, "Take Profit (Reward:Risk)", minval=0.5, step=0.1, group=grp_risk)
+use_regime_exit = input.bool(true, "Use Regime-Based Exits", group=grp_risk)
+use_trail      = input.bool(true, "Use Trailing Stop", group=grp_risk)
+trail_atr_mult = input.float(preset == "Optimized v2 (Swing)" ? 3.5 : preset == "Intraday (1H-15m)" ? 2.0 : 3.0, "Trailing ATR Multiplier", minval=1.0, step=0.1, group=grp_risk)
+
+// --- Module E: Confirmation ---
+grp_conf = "Module E: Confirmation"
+use_conf_vol = input.bool(true, "Use Volume Confirmation", group=grp_conf)
+len_vol_ma   = input.int(20, "Volume MA Length", minval=1, group=grp_conf)
+use_conf_htf = input.bool(preset == "Intraday (1H-15m)" ? false : true, "Use HTF Trend", group=grp_conf)
+htf_res      = input.timeframe(preset == "Intraday (1H-15m)" ? "60" : "240", "HTF Resolution", group=grp_conf)
+
+// =============================================================================
+// MODULE A: REGIME CLASSIFIER
+// =============================================================================
+
+// @function calculateRegime
+// @returns [float trendScore, float rangeScore, bool isSqueeze, bool isHighVol]
+calculateRegime() =>
+    // 1. Trend Strength (ADX + MA Slope)
+    [di_plus, di_minus, adx] = ta.dmi(len_adx, len_adx)
+    
+    // MA Slope (Simple approximation using change)
+    ma = ta.sma(close, len_ma_slope)
+    ma_slope = (ma - ma[1]) / syminfo.mintick
+    
+    // Normalize scores (0-100)
+    score_adx = math.min(100, (adx / 50) * 100) // Cap at 100 if ADX > 50
+    score_slope = math.min(100, (math.abs(ma_slope) / th_ma_slope) * 100)
+    
+    internal_trend_score = (score_adx + score_slope) / 2
+    
+    // 2. Range Strength (Choppiness Index)
+    // CI = 100 * LOG10( SUM(ATR(1), n) / ( MaxHi(n) - MinLo(n) ) ) / LOG10(n)
+    ci = 100 * math.log10(math.sum(ta.atr(1), len_chop) / (ta.highest(len_chop) - ta.lowest(len_chop))) / math.log10(len_chop)
+    
+    // High CI = Range, Low CI = Trend
+    // Map CI > 61.8 to high range score
+    internal_range_score = 0.0
+    if ci > th_chop_high
+        internal_range_score := 100.0
+    else if ci < th_chop_low
+        internal_range_score := 0.0
+    else
+        // Linear interpolation between low and high
+        internal_range_score := ((ci - th_chop_low) / (th_chop_high - th_chop_low)) * 100
+        
+    // 3. Volatility (BB Width + ATR)
+    [bb_mid, bb_upper, bb_lower] = ta.bb(close, 20, 2.0)
+    bb_width = (bb_upper - bb_lower) / bb_mid
+    
+    // Simple Squeeze detection (BB Width lowest in X bars)
+    is_squeeze = bb_width < ta.lowest(bb_width, 20)[1]
+    is_high_vol = bb_width > ta.highest(bb_width, 20)[1]
+    
+    [internal_trend_score, internal_range_score, is_squeeze, is_high_vol]
+
+// Get Regime Data
+[regime_trend_score, regime_range_score, is_squeeze, is_high_vol] = calculateRegime()
+
+// Determine Dominant Regime
+is_trend_regime = regime_trend_score > regime_range_score and regime_trend_score > 50
+is_range_regime = regime_range_score > regime_trend_score and regime_range_score > 50
+
+// =============================================================================
+// MODULE B: TREND ENGINE
+// =============================================================================
+calculateTrendEngine() =>
+    // Trend MA
+    trend_ma = ta.sma(close, len_trend_ma)
+    
+    // Donchian Channel
+    upper_ch = ta.highest(high, len_channel)[1]
+    lower_ch = ta.lowest(low, len_channel)[1]
+    
+    // Pullback / Structure Logic
+    is_bull_candle = close > open
+    is_bear_candle = close < open
+    
+    // Stricter Filter: ADX must be decent for trend trades to avoid chop
+    [di_plus, di_minus, adx] = ta.dmi(len_adx, len_adx)
+    is_trend_strong = adx > th_adx_trend
+    
+    // Signal Generation
+    // 1. Breakout
+    sig_breakout_long = close > upper_ch
+    sig_breakout_short = close < lower_ch
+    
+    // 2. Trend Pullback
+    dist_to_ma = math.abs(low - trend_ma) / trend_ma
+    is_near_ma = dist_to_ma < 0.005 // 0.5% tolerance
+    
+    sig_pullback_long = close > trend_ma and is_near_ma and is_bull_candle and is_trend_strong
+    sig_pullback_short = close < trend_ma and (math.abs(high - trend_ma)/trend_ma < 0.005) and is_bear_candle and is_trend_strong
+    
+    [sig_breakout_long or sig_pullback_long, sig_breakout_short or sig_pullback_short, trend_ma]
+
+[trend_signal_long, trend_signal_short, trend_ma] = calculateTrendEngine()
+
+// =============================================================================
+// MODULE C: MEAN REVERSION ENGINE
+// =============================================================================
+calculateMeanReversionEngine() =>
+    // Bollinger Bands
+    [bb_mid, bb_upper, bb_lower] = ta.bb(close, len_bb, mult_bb)
+    
+    // RSI
+    rsi = ta.rsi(close, len_rsi)
+    
+    // Logic: Price extreme + RSI extreme
+    // Long: Low punctures Lower BB + RSI < Oversold
+    sig_rev_long = low < bb_lower and rsi < th_rsi_os
+    
+    // Short: High punctures Upper BB + RSI > Overbought
+    sig_rev_short = high > bb_upper and rsi > th_rsi_ob
+    
+    [sig_rev_long, sig_rev_short]
+
+[rev_signal_long, rev_signal_short] = calculateMeanReversionEngine()
+
+// =============================================================================
+// MODULE D: VOLATILITY & RISK
+// =============================================================================
+calculateRisk(float sl_dist) =>
+    // Calculate Position Size based on Risk %
+    // Risk Amount = Equity * Risk%
+    // Position Size = Risk Amount / SL Distance
+    
+    risk_amt = strategy.equity * (risk_per_trade / 100)
+    // Avoid division by zero
+    safe_sl = math.max(sl_dist, syminfo.mintick)
+    qty_size = risk_amt / safe_sl
+    qty_size
+
+// =============================================================================
+// MODULE E: CONFIRMATION
+// =============================================================================
+calculateConfirmation() =>
+    // 1. Volume Confirmation
+    vol_ma = ta.sma(volume, len_vol_ma)
+    is_vol_valid = not use_conf_vol or (volume > vol_ma)
+    
+    // 2. HTF Trend Confirmation
+    // HTF Close > HTF MA (200)
+    htf_close = request.security(syminfo.tickerid, htf_res, close, lookahead=barmerge.lookahead_off)
+    htf_ma = request.security(syminfo.tickerid, htf_res, ta.sma(close, 200), lookahead=barmerge.lookahead_off)
+    is_htf_uptrend = htf_close > htf_ma
+    is_htf_downtrend = htf_close < htf_ma
+    
+    is_htf_valid_long = not use_conf_htf or is_htf_uptrend
+    is_htf_valid_short = not use_conf_htf or is_htf_downtrend
+    
+    [is_vol_valid, is_htf_valid_long, is_htf_valid_short]
+
+[conf_vol, conf_htf_long, conf_htf_short] = calculateConfirmation()
+
+// =============================================================================
+// UNIFIED CORE & EXECUTION
+// =============================================================================
+
+// 1. Signal Selection
+raw_long = false
+raw_short = false
+
+if is_trend_regime
+    raw_long := trend_signal_long
+    raw_short := trend_signal_short
+else if is_range_regime
+    raw_long := rev_signal_long
+    raw_short := rev_signal_short
+
+// 2. Apply Confirmation
+final_long = raw_long and conf_vol and conf_htf_long
+final_short = raw_short and conf_vol and conf_htf_short
+
+// 3. Execution & Risk Management
+atr = ta.atr(atr_len)
+sl_dist = atr * atr_mult_stop
+tp_dist = sl_dist * tp_rr
+
+// Track previous regime for change detection
+var bool prev_was_trend = false
+var bool prev_was_range = false
+
+// Regime-Based Exits: Close position if regime changes unfavorably
+if use_regime_exit
+    // Close Long if we were in trend regime and now we're not
+    if strategy.position_size > 0 and prev_was_trend and not is_trend_regime
+        strategy.close_all(comment="Regime Exit")
+    
+    // Close Short if we were in trend regime and now we're not  
+    if strategy.position_size < 0 and prev_was_trend and not is_trend_regime
+        strategy.close_all(comment="Regime Exit")
+    
+    // Close mean reversion trades if regime flips away from range
+    if strategy.position_size > 0 and prev_was_range and not is_range_regime
+        strategy.close_all(comment="Regime Exit")
+    
+    if strategy.position_size < 0 and prev_was_range and not is_range_regime
+        strategy.close_all(comment="Regime Exit")
+
+// Update regime tracking
+prev_was_trend := is_trend_regime
+prev_was_range := is_range_regime
+
+// Entry Logic
+if final_long
+    qty_l = calculateRisk(sl_dist)
+    strategy.entry("Long", strategy.long, qty=qty_l)
+    strategy.exit("Exit Long", "Long", stop=close - sl_dist, limit=close + tp_dist)
+
+if final_short
+    qty_s = calculateRisk(sl_dist)
+    strategy.entry("Short", strategy.short, qty=qty_s)
+    strategy.exit("Exit Short", "Short", stop=close + sl_dist, limit=close - tp_dist)
+
+// Trailing Stop Implementation (ATR Based)
+if use_trail
+    // For Longs
+    if strategy.position_size > 0
+        // Calculate theoretical trailing stop price
+        float trail_stop_l = high - (atr * trail_atr_mult)
+        // Only move stop UP
+        var float active_sl_l = na
+        if final_long // Reset on new entry
+            active_sl_l := close - sl_dist
+        
+        if not na(active_sl_l)
+            if trail_stop_l > active_sl_l
+                active_sl_l := trail_stop_l
+            
+            strategy.exit("Exit Long", "Long", stop=active_sl_l, limit=strategy.position_avg_price + (sl_dist * tp_rr))
+
+    // For Shorts
+    if strategy.position_size < 0
+        float trail_stop_s = low + (atr * trail_atr_mult)
+        var float active_sl_s = na
+        if final_short
+            active_sl_s := close + sl_dist
+        
+        if not na(active_sl_s)
+            if trail_stop_s < active_sl_s
+                active_sl_s := trail_stop_s
+            
+            strategy.exit("Exit Short", "Short", stop=active_sl_s, limit=strategy.position_avg_price - (sl_dist * tp_rr))
+
+// =============================================================================
+// VISUALS
+// =============================================================================
+// Background Color for Regime (Cleaner)
+bgcolor(is_trend_regime ? color.new(color.green, 95) : is_range_regime ? color.new(color.red, 95) : na, title="Regime Background")
+
+// Visuals for Indicators
+plot(trend_ma, "Trend MA", color=is_trend_regime ? color.yellow : na)
+
+// Standard Channel
+plot(ta.highest(high, len_channel)[1], "Upper Channel", color=is_trend_regime ? color.new(color.blue, 50) : na)
+plot(ta.lowest(low, len_channel)[1], "Lower Channel", color=is_trend_regime ? color.new(color.blue, 50) : na)
+
+[bb_m, bb_u, bb_l] = ta.bb(close, len_bb, mult_bb)
+plot(bb_u, "BB Upper", color=is_range_regime ? color.new(color.purple, 50) : na)
+plot(bb_l, "BB Lower", color=is_range_regime ? color.new(color.purple, 50) : na)

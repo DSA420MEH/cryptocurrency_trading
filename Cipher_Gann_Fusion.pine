@@ -1,0 +1,601 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © vumanchu & GannFanOptimizer Authors
+//@version=6
+indicator("Cipher & Gann Fusion", shorttitle="Cipher-Gann-Fusion", overlay=true)
+
+// -----------------------------------------------------------------------------
+// 1. TYPES (from GannFanOptimizer)
+// -----------------------------------------------------------------------------
+type PivotCandidate
+    float price
+    int   idx
+    float score   
+    float vol     
+
+type AnchorPoint
+    float price
+    int   idx
+    float vol     
+
+type ProfileStats
+    float poc
+    float vah
+    float val
+
+// -----------------------------------------------------------------------------
+// 2. INPUTS
+// -----------------------------------------------------------------------------
+grp_struct  = "🏗️ STRUCTURE (Gann & VP)"
+autoProfile = input.string("Manual / Custom", "Chart Profile", options=["Manual / Custom", "Scalping (1m-15m)", "1H (Intraday Fast)", "4H (Swing Standard)", "Daily (Macro Structure)", "Weekly (Long Term)"], group=grp_struct)
+anchorSrc   = input.string("Wicks (Standard)", "Anchor Precision", options=["Wicks (Standard)", "Bodies (Open/Close)"], group=grp_struct)
+gridDensity = input.float(1.0, "Grid Density", minval=0.5, maxval=2.0, step=0.1, group=grp_struct)
+histScale   = input.float(1.0, "History Scale", minval=0.5, maxval=3.0, step=0.1, group=grp_struct)
+showVP      = input.bool(true, "Show Volume Profile", group=grp_struct)
+showFans    = input.bool(true, "Show Gann Fans", group=grp_struct)
+
+grp_trend   = "📈 TREND (EMA Ribbon)"
+showRibbon  = input.bool(true, "Show EMA Ribbon", group=grp_trend)
+ema1Len     = input.int(5, "EMA 1 Length", group=grp_trend)
+ema2Len     = input.int(11, "EMA 2 Length", group=grp_trend)
+ema3Len     = input.int(15, "EMA 3 Length", group=grp_trend)
+ema4Len     = input.int(18, "EMA 4 Length", group=grp_trend)
+ema5Len     = input.int(21, "EMA 5 Length", group=grp_trend)
+ema6Len     = input.int(24, "EMA 6 Length", group=grp_trend)
+ema7Len     = input.int(28, "EMA 7 Length", group=grp_trend)
+ema8Len     = input.int(34, "EMA 8 Length", group=grp_trend)
+showCloudEMAs = input.bool(true, "Show Cloud EMAs (21/55/200)", tooltip="Displays 21/55/200 EMAs with fill. Green cloud = bullish zone, acts as support.", group=grp_trend)
+
+grp_mom     = "🌊 MOMENTUM (WaveTrend)"
+wtChannelLen = input.int(9, "WT Channel Length", group=grp_mom)
+wtAverageLen = input.int(13, "WT Average Length", group=grp_mom)
+wtMASource   = input.source(hlc3, "WT MA Source", group=grp_mom)
+wtMALen      = input.int(3, "WT MA Length", group=grp_mom)
+obLevel      = input.int(53, "WT Overbought Level 1", group=grp_mom)
+obLevel2     = input.int(60, "WT Overbought Level 2", group=grp_mom)
+osLevel      = input.int(-53, "WT Oversold Level 1", group=grp_mom)
+osLevel2     = input.int(-60, "WT Oversold Level 2", group=grp_mom)
+osLevel3     = input.int(-80, "WT Oversold Level 3", group=grp_mom)
+showDivs     = input.bool(true, "Show Divergences", group=grp_mom)
+rsiLen       = input.int(14, "RSI Length", group=grp_mom)
+rsiSRC       = input.source(close, "RSI Source", group=grp_mom)
+rsiMFIperiod = input.int(60, "RSI+MFI Period", group=grp_mom)
+rsiMFIMultiplier = input.int(150, "RSI+MFI Multiplier", group=grp_mom)
+
+grp_signals = "🎯 SIGNALS"
+showAllSignals = input.bool(true, "Show All Signals", group=grp_signals)
+showCipherA = input.bool(true, "Show Cipher A Signals", group=grp_signals)
+showCipherB = input.bool(true, "Show Cipher B Signals", group=grp_signals)
+
+grp_conf    = "✨ CONFLUENCE"
+showConf    = input.bool(true, "Show Confluence Signals", group=grp_conf)
+confDist    = input.float(0.5, "Confluence Distance % (ATR)", minval=0.1, step=0.1, group=grp_conf)
+
+// -----------------------------------------------------------------------------
+// 3. STORAGE & HELPERS
+// -----------------------------------------------------------------------------
+var PivotCandidate[] pDataArrayLow = array.new<PivotCandidate>(0)
+var PivotCandidate[] pDataArrayHigh = array.new<PivotCandidate>(0)
+var float[] winPrices_Macro = array.new_float(0) 
+var float[] winVols_Macro   = array.new_float(0)
+var line[] fanLines = array.new_line()
+var label[] fanLabels = array.new_label()
+var line[] vpLines = array.new_line()
+var box[] vpBoxes = array.new_box()
+
+var float winMaxPrice = -1.0e10
+var float winMinPrice = 1.0e10
+var int winBarCount = 0
+
+// Auto-Profile Logic
+var int c_lookback = na
+var int c_pivot    = na
+var int c_minDist  = na
+var int c_vpRows   = na
+var float c_slope  = na
+var int c_sample   = 1
+
+float invDensity = 1.0 / gridDensity
+
+if autoProfile == "Manual / Custom"
+    c_lookback := 1000
+    c_pivot    := 20
+    c_minDist  := 70
+    c_vpRows   := 70
+    c_slope    := 0.9
+    c_sample   := 1 
+else if autoProfile == "Scalping (1m-15m)"
+    c_lookback := math.round(300 * histScale)
+    c_pivot    := math.round(5 * invDensity)
+    c_minDist  := math.round(15 * invDensity)
+    c_vpRows   := 30
+    c_slope    := 0.7
+    c_sample   := 1
+else if autoProfile == "1H (Intraday Fast)"
+    c_lookback := math.round(600 * histScale)
+    c_pivot    := math.round(10 * invDensity)
+    c_minDist  := math.round(30 * invDensity)
+    c_vpRows   := 50
+    c_slope    := 0.85
+    c_sample   := 2
+else if autoProfile == "4H (Swing Standard)"
+    c_lookback := math.round(1200 * histScale)
+    c_pivot    := math.round(20 * invDensity)
+    c_minDist  := math.round(60 * invDensity)
+    c_vpRows   := 80
+    c_slope    := 1.0
+    c_sample   := 1
+else if autoProfile == "Daily (Macro Structure)"
+    c_lookback := math.round(1800 * histScale)
+    c_pivot    := math.round(30 * invDensity)
+    c_minDist  := math.round(100 * invDensity)
+    c_vpRows   := 120
+    c_slope    := 1.1
+    c_sample   := 1
+else if autoProfile == "Weekly (Long Term)"
+    c_lookback := math.round(2500 * histScale)
+    c_pivot    := math.round(50 * invDensity)
+    c_minDist  := math.round(150 * invDensity)
+    c_vpRows   := 150
+    c_slope    := 1.2
+    c_sample   := 1
+
+// Auto-Optimized Indicator Parameters (based on Chart Profile)
+var int opt_ema1 = na
+var int opt_ema2 = na
+var int opt_ema8 = na
+var int opt_wtChannel = na
+var int opt_wtAverage = na
+var int opt_rsiLen = na
+var float opt_confDist = na
+
+if autoProfile == "Manual / Custom"
+    // Use user's manual settings (no override)
+    opt_ema1 := ema1Len
+    opt_ema2 := ema2Len
+    opt_ema8 := ema8Len
+    opt_wtChannel := wtChannelLen
+    opt_wtAverage := wtAverageLen
+    opt_rsiLen := rsiLen
+    opt_confDist := confDist
+else if autoProfile == "Scalping (1m-15m)"
+    // Fast, sensitive settings for scalping
+    opt_ema1 := 3
+    opt_ema2 := 8
+    opt_ema8 := 21
+    opt_wtChannel := 6
+    opt_wtAverage := 9
+    opt_rsiLen := 7
+    opt_confDist := 0.3
+else if autoProfile == "1H (Intraday Fast)"
+    // Balanced settings for 1H intraday
+    opt_ema1 := 5
+    opt_ema2 := 11
+    opt_ema8 := 34
+    opt_wtChannel := 9
+    opt_wtAverage := 12
+    opt_rsiLen := 14
+    opt_confDist := 0.5
+else if autoProfile == "4H (Swing Standard)"
+    // Standard settings for 4H swing trading
+    opt_ema1 := 5
+    opt_ema2 := 11
+    opt_ema8 := 34
+    opt_wtChannel := 10
+    opt_wtAverage := 21
+    opt_rsiLen := 14
+    opt_confDist := 0.7
+else if autoProfile == "Daily (Macro Structure)"
+    // Slower, smoother settings for daily
+    opt_ema1 := 8
+    opt_ema2 := 13
+    opt_ema8 := 50
+    opt_wtChannel := 10
+    opt_wtAverage := 21
+    opt_rsiLen := 21
+    opt_confDist := 1.0
+else if autoProfile == "Weekly (Long Term)"
+    // Very slow settings for weekly/monthly
+    opt_ema1 := 13
+    opt_ema2 := 21
+    opt_ema8 := 89
+    opt_wtChannel := 14
+    opt_wtAverage := 28
+    opt_rsiLen := 28
+    opt_confDist := 1.5
+
+// Apply optimized parameters (override user inputs when auto-profile is selected)
+int final_ema1 = autoProfile == "Manual / Custom" ? ema1Len : opt_ema1
+int final_ema2 = autoProfile == "Manual / Custom" ? ema2Len : opt_ema2
+int final_ema8 = autoProfile == "Manual / Custom" ? ema8Len : opt_ema8
+int final_wtChannel = autoProfile == "Manual / Custom" ? wtChannelLen : opt_wtChannel
+int final_wtAverage = autoProfile == "Manual / Custom" ? wtAverageLen : opt_wtAverage
+int final_rsiLen = autoProfile == "Manual / Custom" ? rsiLen : opt_rsiLen
+float final_confDist = autoProfile == "Manual / Custom" ? confDist : opt_confDist
+
+// Helper Functions
+clearGraphics() =>
+    if array.size(fanLines) > 0
+        for i = 0 to array.size(fanLines) - 1
+            line.delete(array.get(fanLines, i))
+        array.clear(fanLines)
+    if array.size(fanLabels) > 0
+        for i = 0 to array.size(fanLabels) - 1
+            label.delete(array.get(fanLabels, i))
+        array.clear(fanLabels)
+    if array.size(vpLines) > 0
+        for i = 0 to array.size(vpLines) - 1
+            line.delete(array.get(vpLines, i))
+        array.clear(vpLines)
+    if array.size(vpBoxes) > 0
+        for i = 0 to array.size(vpBoxes) - 1
+            box.delete(array.get(vpBoxes, i))
+        array.clear(vpBoxes)
+
+isFarEnough(int newIdx, int existingIdx, int minDist) => 
+    na(existingIdx) or math.abs(newIdx - existingIdx) >= minDist
+
+drawFanLine(int idx, float price, float baseSlope, float mult, float direction, color c, int w, string st) =>
+    line.new(idx, price, idx + 10, price + (baseSlope * mult * 10 * direction), color=c, width=w, style=st, extend=extend.right)
+
+drawFan(int idx, float price, float slope, float direction, color col, bool show) =>
+    if show and not na(idx) and not na(price)
+        array.push(fanLines, drawFanLine(idx, price, slope, 1.0, direction, col, 2, line.style_solid))
+        array.push(fanLines, drawFanLine(idx, price, slope, 2.0, direction, color.new(col, 30), 1, line.style_solid))
+        array.push(fanLines, drawFanLine(idx, price, slope, 0.5, direction, color.new(col, 30), 1, line.style_solid))
+
+findNextAnchor(AnchorPoint exclude1, AnchorPoint exclude2, float[] scores, PivotCandidate[] calcData, bool[] used, int minDist) =>
+    AnchorPoint res = AnchorPoint.new(na, na, na)
+    for s = 0 to array.size(scores) - 1
+        float tScore = array.get(scores, s)
+        for c = 0 to array.size(calcData) - 1
+            if not array.get(used, c)
+                PivotCandidate cand = array.get(calcData, c)
+                if math.abs(cand.score - tScore) < 1e-5
+                    bool d1 = isFarEnough(cand.idx, exclude1.idx, minDist)
+                    bool d2 = isFarEnough(cand.idx, exclude2.idx, minDist)
+                    if d1 and d2
+                        res.price := cand.price
+                        res.idx   := cand.idx
+                        res.vol   := cand.vol
+                        array.set(used, c, true)
+                    break
+        if not na(res.idx)
+            break
+    res
+
+getProfileStats(float[] prices, float[] vols, float minP, float maxP, int rows, float valPct, bool filterNoise, float avgVol) =>
+    ProfileStats stats = ProfileStats.new(na, na, na)
+    if array.size(prices) > 0
+        float rangeSize = maxP - minP
+        float rowSize = rangeSize / rows
+        if rowSize > 0
+            float[] buckets = array.new_float(rows, 0.0)
+            float totalVol = 0.0
+            int limit = array.size(prices)
+            for i = 0 to limit - 1
+                float p = array.get(prices, i)
+                float v = array.get(vols, i)
+                if not filterNoise or (v > (avgVol * 0.2))
+                    int idx = math.floor((p - minP) / rowSize)
+                    idx := math.min(idx, rows - 1)
+                    idx := math.max(idx, 0)
+                    array.set(buckets, idx, array.get(buckets, idx) + v)
+                    totalVol += v
+            int maxIdx = 0
+            float maxV = 0.0
+            for j = 0 to rows - 1
+                float bv = array.get(buckets, j)
+                if bv > maxV
+                    maxV := bv
+                    maxIdx := j
+            stats.poc := minP + (maxIdx * rowSize) + (rowSize / 2)
+            float targetVA = totalVol * (valPct / 100.0)
+            float currentVA = maxV
+            int upIdx = maxIdx
+            int dnIdx = maxIdx
+            while currentVA < targetVA
+                float upVol = (upIdx < rows - 1) ? array.get(buckets, upIdx + 1) : 0.0
+                float dnVol = (dnIdx > 0) ? array.get(buckets, dnIdx - 1) : 0.0
+                if upVol == 0.0 and dnVol == 0.0
+                    break
+                if upVol >= dnVol
+                    upIdx += 1
+                    currentVA += upVol
+                else
+                    dnIdx -= 1
+                    currentVA += dnVol
+            stats.vah := minP + (upIdx * rowSize)
+            stats.val := minP + (dnIdx * rowSize)
+    stats
+
+boostScores(PivotCandidate[] arr, float poc, float vah, float val, float rangeP) =>
+    if not na(poc)
+        float maxBoost = 0.15 
+        for i = 0 to array.size(arr) - 1
+            PivotCandidate c = array.get(arr, i)
+            float dist = math.abs(c.price - poc)
+            float normDist = dist / (rangeP == 0 ? 1 : rangeP)
+            if normDist < 0.2
+                float boost = (1.0 - (normDist * 5)) * maxBoost
+                if boost > 0
+                    c.score := c.score * (1.0 + boost)
+            array.set(arr, i, c)
+
+// -----------------------------------------------------------------------------
+// 4. INDICATOR FUNCTIONS (Cipher A & B)
+// -----------------------------------------------------------------------------
+
+// RSI+MFI
+f_rsimfi(_period, _multiplier, _tf) => request.security(syminfo.tickerid, _tf, ta.sma(((close - open) / (high - low)) * _multiplier, _period))
+
+// EMA Ribbon
+f_emaRibbon(_src, _e1, _e2, _e3, _e4, _e5, _e6, _e7, _e8) =>
+    _ema1 = ta.ema(_src, _e1)
+    _ema2 = ta.ema(_src, _e2)
+    _ema3 = ta.ema(_src, _e3)
+    _ema4 = ta.ema(_src, _e4)
+    _ema5 = ta.ema(_src, _e5)
+    _ema6 = ta.ema(_src, _e6)
+    _ema7 = ta.ema(_src, _e7)
+    _ema8 = ta.ema(_src, _e8)
+    [_ema1, _ema2, _ema3, _ema4, _ema5, _ema6, _ema7, _ema8]
+
+// WaveTrend
+f_wavetrend(_src, _chlen, _avg, _malen) =>
+    _esa = ta.ema(_src, _chlen)
+    _de = ta.ema(math.abs(_src - _esa), _chlen)
+    _ci = (_src - _esa) / (0.015 * _de)
+    _tci = ta.ema(_ci, _avg)
+    _wt1 = _tci
+    _wt2 = ta.sma(_wt1, _malen)
+    [_wt1, _wt2]
+
+// Divergences
+f_fractalize(src)  => src[4] < src[2] and src[3] < src[2] and src[2] > src[1] and src[2] > src[0] ? 1 :
+                      src[4] > src[2] and src[3] > src[2] and src[2] < src[1] and src[2] < src[0] ? -1 : 0
+
+f_findDivs(src, topLimit, botLimit, useLimits) =>
+    fractalTop = f_fractalize(src) > 0 and (useLimits ? src[2] >= topLimit : true) ? src[2] : na
+    fractalBot = f_fractalize(src) < 0 and (useLimits ? src[2] <= botLimit : true) ? src[2] : na
+    highPrev = ta.valuewhen(not na(fractalTop), src[2], 0)[2]
+    highPrice = ta.valuewhen(not na(fractalTop), high[2], 0)[2]
+    lowPrev = ta.valuewhen(not na(fractalBot), src[2], 0)[2]
+    lowPrice = ta.valuewhen(not na(fractalBot), low[2], 0)[2]
+    bearSignal = not na(fractalTop) and high[2] > highPrice and src[2] < highPrev
+    bullSignal = not na(fractalBot) and low[2] < lowPrice and src[2] > lowPrev
+    bearDivHidden = not na(fractalTop) and high[2] < highPrice and src[2] > highPrev
+    bullDivHidden = not na(fractalBot) and low[2] > lowPrice and src[2] < lowPrev
+    [fractalTop, fractalBot, lowPrev, bearSignal, bullSignal, bearDivHidden, bullDivHidden]
+
+// -----------------------------------------------------------------------------
+// 5. CALCULATIONS
+// -----------------------------------------------------------------------------
+
+// --- TREND (Ribbon) ---
+[ema1, ema2, ema3, ema4, ema5, ema6, ema7, ema8] = f_emaRibbon(close, final_ema1, final_ema2, ema3Len, ema4Len, ema5Len, ema6Len, ema7Len, final_ema8)
+ribbonDir = ema8 < ema2
+colorEma = ribbonDir ? color.green : color.red
+
+// --- MOMENTUM (WaveTrend) ---
+[wt1, wt2] = f_wavetrend(wtMASource, final_wtChannel, final_wtAverage, wtMALen)
+[fractalTop, fractalBot, wtLow_prev, bearSignal, bullSignal, bearDivHidden, bullDivHidden] = f_findDivs(wt2, obLevel2, osLevel2, true)
+
+wtOverSold = wt2 <= osLevel
+wtOverBought = wt2 >= obLevel
+wtCross = ta.cross(wt1, wt2)
+wtCrossUp = wt2 - wt1 <= 0
+wtCrossDown = wt2 - wt1 >= 0
+
+// RSI + MFI
+rsi = ta.rsi(rsiSRC, final_rsiLen)
+rsiMFI = f_rsimfi(rsiMFIperiod, rsiMFIMultiplier, timeframe.period)
+
+// Cipher A Signals
+longEma = ta.crossover(ema2, ema8)
+shortEma = ta.crossover(ema8, ema2)
+redCross = ta.crossunder(ema1, ema2)
+blueTriangle = ta.crossover(ema2, ema3)
+redDiamond = wtCross and wtCrossDown
+emaCrossUnder = ta.crossunder(ema1, ema2)
+bloodDiamond = redDiamond and emaCrossUnder
+yellowCross = redDiamond and wt2 < 45 and wt2 > osLevel3 and rsi < 30 and rsi > 15 and rsiMFI < -5
+bullCandle = open > ema2 and open > ema8 and (close[1] > open[1]) and (close > open) and not redDiamond and not redCross
+
+// Cipher B Signals
+wtGoldBuy = ((showDivs and bullSignal) or (showDivs and bullSignal)) and
+           wtLow_prev <= osLevel3 and
+           wt2 > osLevel3 and
+           wtLow_prev - wt2 <= -5 and
+           rsi < 30
+
+max_bars_back(bloodDiamond, 500)
+max_bars_back(bullSignal, 500)
+max_bars_back(bearSignal, 500)
+max_bars_back(wtGoldBuy, 500)
+max_bars_back(yellowCross, 500)
+
+// Cloud EMAs (21/55/200)
+ema21 = ta.ema(close, 21)
+ema55 = ta.ema(close, 55)
+ema200 = ta.ema(close, 200)
+
+// --- STRUCTURE (Gann & VP) ---
+// Data Collection
+float haClose = (open + high + low + close) / 4
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2 : (haOpen[1] + haClose[1]) / 2
+float haHigh = math.max(high, math.max(haOpen, haClose))
+float haLow = math.min(low, math.min(haOpen, haClose))
+
+float srcLow  = low
+float srcHigh = high
+if anchorSrc == "Wicks (Standard)"
+    srcLow := low
+    srcHigh := high
+else 
+    srcLow := math.min(open, close)
+    srcHigh := math.max(open, close)
+
+float srcVol  = volume
+float currentATR = ta.atr(14)
+float avgVol100 = ta.sma(volume, 100)
+
+int estimatedTimeDelta = c_lookback * timeframe.in_seconds() * 1000
+int autoStartTime = timenow - estimatedTimeDelta
+bool inWindow = time >= autoStartTime
+
+int k = c_pivot
+int l = c_pivot
+float pLow  = ta.pivotlow(srcLow, k, l)
+float pHigh = ta.pivothigh(srcHigh, k, l)
+float highestInLookback = ta.highest(srcHigh, k)
+float lowestInLookback  = ta.lowest(srcLow, k)
+float maxVolRecent      = ta.highest(srcVol, 100)
+
+if inWindow
+    winMaxPrice := math.max(winMaxPrice, srcHigh)
+    winMinPrice := math.min(winMinPrice, srcLow)
+    winBarCount += 1
+    
+    if bar_index % c_sample == 0
+        array.push(winPrices_Macro, (srcHigh + srcLow) / 2)
+        array.push(winVols_Macro, srcVol)
+
+    int pIndex = bar_index - l
+    float volFactor = (srcVol / (maxVolRecent == 0 ? 1 : maxVolRecent))
+
+    if not na(pLow)
+        float scoreLow = volFactor * (highestInLookback - pLow)
+        array.push(pDataArrayLow, PivotCandidate.new(pLow, pIndex, scoreLow, currentATR[l]))
+
+    if not na(pHigh)
+        float scoreHigh = volFactor * (pHigh - lowestInLookback)
+        array.push(pDataArrayHigh, PivotCandidate.new(pHigh, pIndex, scoreHigh, currentATR[l]))
+
+// -----------------------------------------------------------------------------
+// 6. EXECUTION & DRAWING
+// -----------------------------------------------------------------------------
+
+// Draw Ribbon (with gradient colors matching Cipher A)
+p1 = plot(showRibbon ? ema1 : na, color=showRibbon ? (ribbonDir ? #1573d4 : #ef5350) : na, linewidth=1, title="EMA 1")
+p2 = plot(showRibbon ? ema2 : na, color=showRibbon ? (ribbonDir ? #3096ff : #ef5350) : na, linewidth=1, title="EMA 2")
+plot(showRibbon ? ema3 : na, color=showRibbon ? (ribbonDir ? #57abff : #ef5350) : na, linewidth=1, title="EMA 3")
+plot(showRibbon ? ema4 : na, color=showRibbon ? (ribbonDir ? #85c2ff : #ef5350) : na, linewidth=1, title="EMA 4")
+plot(showRibbon ? ema5 : na, color=showRibbon ? (ribbonDir ? color.yellow : color.yellow) : na, linewidth=1, title="EMA 5")
+plot(showRibbon ? ema6 : na, color=showRibbon ? (ribbonDir ? #b3d9ff : #ef5350) : na, linewidth=1, title="EMA 6")
+plot(showRibbon ? ema7 : na, color=showRibbon ? (ribbonDir ? #c9e5ff : #ef5350) : na, linewidth=1, title="EMA 7")
+plot(showRibbon ? ema8 : na, color=showRibbon ? (ribbonDir ? #dfecfb : #ef5350) : na, linewidth=1, title="EMA 8")
+p8 = plot(showRibbon ? ema8 : na, color=showRibbon ? na : colorEma, linewidth=2, title="EMA 8 Bold")
+fill(p1, p2, color=color.new(#1573d4, 90))
+fill(p2, p8, color=color.new(#363a45, 90))
+
+// Cloud EMAs (21/55/200)
+p21 = plot(showCloudEMAs ? ema21 : na, color=#FFF202, linewidth=2, title="EMA 21")
+p55 = plot(showCloudEMAs ? ema55 : na, color=#02F539, linewidth=2, title="EMA 55")
+p200 = plot(showCloudEMAs ? ema200 : na, color=#F50202, linewidth=2, title="EMA 200")
+fill(p55, p200, color=color.new(#02F539, 90))
+
+// Draw WT Signals
+plotshape(showDivs and bullSignal, style=shape.triangleup, color=color.green, location=location.belowbar, size=size.tiny, title="Bullish Div")
+plotshape(showDivs and bearSignal, style=shape.triangledown, color=color.red, location=location.abovebar, size=size.tiny, title="Bearish Div")
+
+// Cipher A Signals
+plotshape(showAllSignals and showCipherA and longEma, style=shape.circle, color=#00ff00, location=location.abovebar, size=size.tiny, title="Long EMA Signal")
+plotshape(showAllSignals and showCipherA and shortEma, style=shape.circle, color=#ff0000, location=location.abovebar, size=size.tiny, title="Short EMA Signal")
+plotshape(showAllSignals and showCipherA and redCross, style=shape.xcross, color=#ff0000, location=location.abovebar, size=size.tiny, title="Red Cross")
+plotshape(showAllSignals and showCipherA and blueTriangle, style=shape.triangleup, color=#0064ff, location=location.abovebar, size=size.small, title="Blue Triangle")
+plotshape(showAllSignals and showCipherA and bloodDiamond, style=shape.diamond, color=color.red, location=location.abovebar, size=size.small, title="Blood Diamond")
+plotshape(showAllSignals and showCipherA and yellowCross, style=shape.xcross, color=color.yellow, location=location.abovebar, size=size.small, title="Yellow Cross")
+plotshape(showAllSignals and showCipherA and bullCandle, style=shape.circle, color=color.green, location=location.belowbar, size=size.tiny, title="Bull Candle")
+
+// Cipher B Signals
+plotshape(showAllSignals and showCipherB and wtGoldBuy, style=shape.diamond, color=color.yellow, location=location.belowbar, size=size.small, title="Gold Buy")
+plot(showAllSignals and showCipherB and wtCross ? wt2 : na, title='WT Cross', color=wt2 - wt1 > 0 ? color.new(color.red,15) : color.new(color.lime,15), style=plot.style_circles, linewidth=3)
+
+// Structure Execution (Last Bar)
+if barstate.islast
+    clearGraphics() 
+    bool isDataLoaded = array.size(winPrices_Macro) > 0
+    
+    if isDataLoaded
+        ProfileStats macroStats = getProfileStats(winPrices_Macro, winVols_Macro, winMinPrice, winMaxPrice, c_vpRows, 70.0, false, avgVol100)
+
+        if showVP and not na(macroStats.poc)
+            int startIdx = bar_index - winBarCount
+            l_poc = line.new(startIdx, macroStats.poc, bar_index + 50, macroStats.poc, color=color.new(color.red, 20), width=2)
+            array.push(vpLines, l_poc)
+            b_va = box.new(startIdx, macroStats.vah, bar_index + 50, macroStats.val, border_color=color.new(color.blue, 100), bgcolor=color.new(color.blue, 95))
+            array.push(vpBoxes, b_va)
+
+        float rangeP = winMaxPrice - winMinPrice
+        boostScores(pDataArrayLow, macroStats.poc, macroStats.vah, macroStats.val, rangeP)
+        boostScores(pDataArrayHigh, macroStats.poc, macroStats.vah, macroStats.val, rangeP)
+
+        var AnchorPoint l1 = AnchorPoint.new(na,na,na)
+        if array.size(pDataArrayLow) > 0
+            PivotCandidate[] cLow = array.copy(pDataArrayLow)
+            float[] sLow = array.new_float(0)
+            for i = 0 to array.size(cLow) - 1
+                array.push(sLow, array.get(cLow, i).score)
+            array.sort(sLow, order.descending)
+            bool[] uLow = array.new_bool(array.size(cLow), false)
+            l1 := findNextAnchor(AnchorPoint.new(na,na,na), AnchorPoint.new(na,na,na), sLow, cLow, uLow, c_minDist)
+
+        var AnchorPoint h1 = AnchorPoint.new(na,na,na)
+        if array.size(pDataArrayHigh) > 0
+            PivotCandidate[] cHigh = array.copy(pDataArrayHigh)
+            float[] sHigh = array.new_float(0)
+            for i = 0 to array.size(cHigh) - 1
+                array.push(sHigh, array.get(cHigh, i).score)
+            array.sort(sHigh, order.descending)
+            bool[] uHigh = array.new_bool(array.size(cHigh), false)
+            h1 := findNextAnchor(AnchorPoint.new(na,na,na), AnchorPoint.new(na,na,na), sHigh, cHigh, uHigh, c_minDist)
+
+        float safeBars = math.max(winBarCount, 1)
+        float trendSlope = math.abs(close - open[winBarCount]) / safeBars
+        float slopeVal = trendSlope * c_slope
+
+        if showFans
+            drawFan(l1.idx, l1.price, slopeVal, 1.0, color.green, true)
+            drawFan(h1.idx, h1.price, slopeVal, -1.0, color.red, true)
+
+        // --- CONFLUENCE SCANNER (Historical Loop) ---
+        if showConf and winBarCount > 0
+            int sigLookback = math.min(winBarCount, 300)
+            float atrVal = currentATR
+            float distThresh = atrVal * final_confDist
+            
+            for i = 1 to sigLookback
+                int cIdx = bar_index - i
+                if cIdx >= 0
+                    float cClose = close[i]
+                    float cLow = low[i]
+                    float cHigh = high[i]
+                    
+                    // Reconstruct Signals (Approximate)
+                    // Note: We use the array values for signals, but for simplicity here we check conditions
+                    // Ideally we would store signals in an array too, but looking back at series is easier.
+                    
+                    bool isBullDiv = bullSignal[i]
+                    bool isBearDiv = bearSignal[i]
+                    bool isBlood = bloodDiamond[i]
+                    
+                    // Check Structure Proximity
+                    bool nearL1 = false
+                    if not na(l1.idx) and cIdx > l1.idx
+                        float fanPrice = l1.price + (slopeVal * 1.0 * (cIdx - l1.idx))
+                        if math.abs(cLow - fanPrice) < distThresh or (cLow < fanPrice and cClose > fanPrice) // Touch or reclaim
+                            nearL1 := true
+                            
+                    bool nearH1 = false
+                    if not na(h1.idx) and cIdx > h1.idx
+                        float fanPrice = h1.price + (slopeVal * -1.0 * (cIdx - h1.idx))
+                        if math.abs(cHigh - fanPrice) < distThresh or (cHigh > fanPrice and cClose < fanPrice) // Touch or reject
+                            nearH1 := true
+                            
+                    // Confluence Logic
+                    if nearL1 and (isBullDiv or isBlood)
+                        label.new(cIdx, cLow, "🔥 BUY", yloc=yloc.belowbar, color=color.lime, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+                        
+                    if nearH1 and (isBearDiv or isBlood)
+                        label.new(cIdx, cHigh, "🔥 SELL", yloc=yloc.abovebar, color=color.red, style=label.style_label_down, textcolor=color.white, size=size.tiny)

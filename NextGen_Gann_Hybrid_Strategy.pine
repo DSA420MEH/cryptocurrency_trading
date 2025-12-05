@@ -1,0 +1,1242 @@
+//@version=6
+i_leverage = input.float(1.0, "Leverage (x)", minval=1, maxval=100, step=0.1, group="⚙️ Leverage", tooltip="1x = no leverage, 2x = double position size, etc.")
+strategy("Next-Gen Gann Hybrid: Adaptive Multi-Strategy [Antigravity]", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD, pyramiding=3)
+
+// =============================================================================
+// 1. TYPES (Ported from Gann Pro)
+// =============================================================================
+type PivotCandidate
+    float price
+    int   idx
+    float score   
+    float vol     
+
+type AnchorPoint
+    float price
+    int   idx
+    float vol
+    bool  confirmed
+
+type Regime
+    int   direction // 1 = Bullish, -1 = Bearish
+    float volatility // Current ATR or Vol measure
+    bool  isTrending // True if price is significantly away from EMA
+
+// =============================================================================
+// 2. PRESET SYSTEM (Next-Gen)
+// =============================================================================
+
+preset = input.string("God Mode (12000%)", "📊 Strategy Preset", 
+     options=["God Mode (12000%)", "4h_7000%_8.4pf"], 
+     group="🎯 Preset Selection",
+     tooltip="Select a preset to auto-configure all parameters.")
+
+// =============================================================================
+// 3. INPUTS
+// =============================================================================
+
+// --- Module A: Regime Classifier ---
+grp_regime = "Module A: Regime Classifier"
+i_len_adx      = input.int(20, "ADX Length", minval=1, group=grp_regime)
+i_th_adx_trend = input.int(27, "ADX Trend Threshold", minval=1, group=grp_regime)
+i_len_ma_slope = input.int(52, "MA Slope Length", minval=1, group=grp_regime)
+th_ma_slope    = input.float(0.5, "MA Slope Threshold (deg)", group=grp_regime)
+i_len_chop     = input.int(7, "Choppiness Index Length", minval=1, group=grp_regime)
+i_th_chop_high = input.float(77.8, "Chop High (Range)", group=grp_regime)
+i_th_chop_low  = input.float(34.2, "Chop Low (Trend)", group=grp_regime)
+
+// --- Module B: Trend Engine ---
+grp_trend = "Module B: Trend Engine"
+i_len_trend_ma = input.int(200, "Trend MA Length", minval=1, group=grp_trend)
+len_channel    = input.int(20, "Donchian Channel Length", minval=1, group=grp_trend)
+
+// --- Module C: Mean Reversion ---
+grp_rev = "Module C: Mean Reversion"
+len_bb      = input.int(20, "Bollinger Bands Length", minval=1, group=grp_rev)
+mult_bb     = input.float(2.0, "BB Multiplier", minval=0.1, group=grp_rev)
+len_rsi     = input.int(14, "RSI Length", minval=1, group=grp_rev)
+th_rsi_ob   = input.int(70, "RSI Overbought", minval=50, maxval=100, group=grp_rev)
+th_rsi_os   = input.int(30, "RSI Oversold", minval=0, maxval=50, group=grp_rev)
+
+// --- Module D: Risk & Volatility ---
+grp_risk = "Module D: Risk & Volatility"
+i_risk_per_trade = input.float(1.4, "Risk Per Trade (%)", minval=0.1, step=0.1, group=grp_risk)
+i_atr_len        = input.int(28, "ATR Length", minval=1, group=grp_risk)
+i_atr_mult_stop  = input.float(2.0, "ATR Stop Multiplier", minval=0.5, step=0.1, group=grp_risk)
+i_tp_rr          = input.float(2.0, "Take Profit (Reward:Risk)", minval=0.5, step=0.1, group=grp_risk)
+use_regime_exit  = input.bool(true, "Use Regime-Based Exits", group=grp_risk)
+use_trail        = input.bool(true, "Use Trailing Stop", group=grp_risk)
+i_trail_atr_mult = input.float(3.0, "Trailing ATR Multiplier", minval=1.0, step=0.1, group=grp_risk)
+use_smart_exits  = input.bool(true, "Use Smart Exits", group=grp_risk, tooltip="Enables Regime Hysteresis (Noise Filter), Dynamic Trailing (Momentum Based), and HTF Consensus.")
+weekend_vol_mult = input.float(0.5, "Weekend Volatility Multiplier", minval=0.1, maxval=1.0, step=0.1, group=grp_risk, tooltip="Reduces position size during crypto weekends (Sat/Sun) to account for gap/volatility risk.")
+
+// --- Module E: Confirmation ---
+// --- Module E: Confirmation ---
+grp_conf = "Module E: Confirmation"
+use_conf_vol   = input.bool(true, "Use Volume Confirmation", group=grp_conf)
+len_vol_ma     = input.int(20, "Volume MA Length", minval=1, group=grp_conf)
+i_use_conf_htf = input.bool(true, "Use HTF Trend", group=grp_conf)
+
+// --- Module K: Liquidity Awareness ---
+grp_liquidity = "Module K: Liquidity Awareness"
+use_liquidity_filter = input.bool(false, "Enable Liquidity Filter", group=grp_liquidity)
+min_dollar_volume = input.float(1000000, "Min Dollar Volume ($)", group=grp_liquidity)
+spread_tolerance = input.float(0.15, "Max Spread (%)", group=grp_liquidity)
+
+// Calculate tradeable liquidity
+float dollar_volume = volume * close
+float avg_dollar_volume = ta.sma(dollar_volume, 20)
+float bid_ask_spread = (high - low) / close * 100  // Proxy using H-L
+
+bool is_liquid = dollar_volume > min_dollar_volume and spread_tolerance > bid_ask_spread
+
+// --- Module R: Anti-Manipulation (Wash Trading) ---
+grp_wash = "Module R: Anti-Manipulation"
+use_wash_filter = input.bool(false, "Filter Wash Trading (Spoofing)", group=grp_wash)
+wash_threshold = input.float(8.0, "Spoofing Threshold (Density Ratio)", minval=2.0, group=grp_wash, tooltip="Flags bars with Volume/Range density > 8x average. High volume + no movement = Wash Trading.")
+
+// Calculate Volume Density (Volume per unit of price movement)
+float bar_range_safe = math.max(high - low, syminfo.mintick)
+float vol_density = volume / bar_range_safe
+float avg_vol_density = ta.sma(vol_density, 20)
+
+// Detect Spoofing: Huge volume but price didn't move (80% volume at one price proxy)
+bool is_spoofed = vol_density > (avg_vol_density * wash_threshold)
+i_htf_res      = input.timeframe("240", "HTF Resolution", group=grp_conf)
+
+// --- Module L: Time Intelligence ---
+grp_time = "Module L: Time Intelligence"
+avoid_low_volume_hours = input.bool(true, "Avoid Low Volume Hours", group=grp_time)
+// Crypto: Avoid 12am-6am UTC (thin books, high slippage)
+// Stocks: Only trade 10:00-15:30 ET (avoid open/close chaos)
+
+// --- Module M: Correlation Filter ---
+grp_correlation = "Module M: Correlation Filter"
+use_correlation_filter = input.bool(false, "Avoid High Correlation Regimes", group=grp_correlation)
+correlation_asset = input.string("BTC", "Correlation Asset", options=["BTC", "ETH", "SPY"], group=grp_correlation)
+
+// --- Module N: Execution Intelligence ---
+grp_execution = "Module N: Execution Intelligence"
+use_limit_orders = input.bool(false, "Use Limit Orders", group=grp_execution)
+limit_offset_pct = input.float(0.05, "Limit Order Offset (%)", group=grp_execution)
+
+// --- Module O: Institutional Anchors ---
+grp_anchors = "Module O: Institutional Anchors"
+use_vwap_anchors = input.bool(false, "Use Weekly/Monthly VWAP", group=grp_anchors)
+vwap_buffer_pct = input.float(0.5, "VWAP Respect Buffer (%)", minval=0.1, step=0.1, group=grp_anchors)
+
+// --- Module P: Economic Calendar ---
+grp_news = "Module P: Economic Calendar"
+filter_nfp = input.bool(true, "Block NFP (1st Fri 8:30 ET)", group=grp_news)
+filter_fomc = input.bool(true, "Block FOMC (Wed 14:00 ET)", group=grp_news)
+filter_data_drops = input.bool(true, "Block 8:30 ET Data Drops", group=grp_news)
+
+
+
+// --- Module F: Golden Ratio ---
+grp_golden = "Module F: Golden Ratio"
+use_golden_ratio = input.bool(false, "Use Golden Ratio Filter", group=grp_golden)
+golden_ratio_res = input.timeframe("D", "Golden Ratio Timeframe", group=grp_golden, tooltip="Always use Daily for macro cycle detection")
+golden_sma_fast = input.int(111, "Fast SMA", group=grp_golden)
+golden_sma_slow = input.int(350, "Slow SMA", group=grp_golden)
+// Mode Toggle: Filter vs Risk Scaling
+golden_approach = input.string("Hard Filter", "Approach", options=["Hard Filter", "Risk Scaling"], group=grp_golden, tooltip="Hard Filter = Block trades in extreme zones | Risk Scaling = Reduce/increase position size based on zone")
+// Zone-Based Risk Modes (for Hard Filter)
+golden_mode = input.string("Moderate", "Risk Mode (Filter)", options=["Aggressive", "Moderate", "Conservative"], group=grp_golden, tooltip="Aggressive = Block above 2x | Moderate = Block above 1.618x | Conservative = Block above 1.618x (strict)")
+// Momentum Filter
+use_momentum_filter = input.bool(true, "Use Price Momentum Filter", group=grp_golden, tooltip="Block longs if price is losing momentum near upper levels")
+
+// --- Module G: Gann Logic (NEW) ---
+grp_gann = "Module G: Gann Logic"
+gann_style = input.string("Swing Trading", "Gann Trading Style", options=["Scalping", "Day Trading", "Swing Trading", "Position Trading"], group=grp_gann)
+gann_filter_mode = input.string("Moderate", "Gann Filter Strength", options=["None", "Moderate", "Strict"], group=grp_gann)
+gann_buffer_pct = input.float(0.5, "Gann Respect Buffer (%)", minval=0.1, step=0.1, group=grp_gann, tooltip="Distance from fan line to consider as 'at support/resistance'")
+use_breakout_guard = input.bool(false, "Use Breakout Guard", group=grp_gann, tooltip="Prevents Mean Reversion trades during volatility explosions. Default OFF to match original 7000% logic.")
+
+// --- Module H: Channel Awareness ---
+grp_channel = "Module H: Channel Awareness"
+use_channel_filter = input.bool(false, "Use Channel Position Filter", group=grp_channel, tooltip="Blocks longs at channel top, shorts at channel bottom. Reduces over-trading.")
+channel_position_threshold = input.float(0.70, "Channel Position Threshold", minval=0.5, maxval=0.95, step=0.05, group=grp_channel, tooltip="0.70 = block longs when price is in upper 30% of channel")
+min_bars_in_channel = input.int(10, "Consolidation Detection (Bars)", minval=3, group=grp_channel, tooltip="Number of bars in channel to consider as consolidation")
+require_extreme_rsi_in_consolidation = input.bool(true, "Require Extreme RSI in Consolidation", group=grp_channel, tooltip="In consolidation, only take signals at RSI extremes (<25 or >75)")
+
+// --- Module I: Anti-Whipsaw Protection ---
+grp_whipsaw = "Module I: Anti-Whipsaw Protection"
+use_anti_whipsaw = input.bool(false, "Enable Anti-Whipsaw Filters", group=grp_whipsaw, tooltip="Prevents trades in tight consolidation and failed breakout zones")
+bb_squeeze_threshold = input.int(20, "BB Squeeze Percentile", minval=5, maxval=50, group=grp_whipsaw, tooltip="Block trades when BB width is below this percentile (20 = bottom 20%)")
+rejection_count_trigger = input.int(2, "Rejection Count Trigger", minval=2, maxval=5, group=grp_whipsaw, tooltip="Number of resistance/support touches to consider as failed breakout")
+atr_compression_ratio = input.float(0.65, "ATR Compression Threshold", minval=0.4, maxval=0.9, step=0.05, group=grp_whipsaw, tooltip="Block when current ATR < this ratio of 20-bar average (0.65 = 65%)")
+whipsaw_mode = input.string("Block Mean Reversion Only", "Filter Mode", options=["Block Mean Reversion Only", "Block All Trades"], group=grp_whipsaw, tooltip="Mean Reversion Only = preserve trend breakouts | Block All = very conservative")
+
+// --- Module J: Safety Shield (Risk Management) ---
+grp_safety = "Module J: Safety Shield"
+use_safety_shield = input.bool(true, "Enable Safety Shield", group=grp_safety, tooltip="Prevents margin calls and reduces risk during drawdowns")
+max_leverage_cap = input.int(5, "Max Effective Leverage (1-100x)", minval=1, maxval=100, group=grp_safety, tooltip="Hard cap on position size. Example: 5x means Max Position = Equity * 5")
+max_drawdown_limit = input.float(15.0, "Drawdown Circuit Breaker (%)", minval=5.0, step=1.0, group=grp_safety, tooltip="If account drawdown exceeds this %, risk is automatically cut in half")
+
+// =============================================================================
+// 4. PRESET LOGIC APPLICATION
+// =============================================================================
+is_7000 = preset == "4h_7000%_8.4pf"
+is_god  = preset == "God Mode (12000%)"
+
+// 1. Regime Parameters
+len_adx      = is_god ? 19 : is_7000 ? 19 : i_len_adx
+th_adx_trend = is_god ? 39 : is_7000 ? 39 : i_th_adx_trend
+len_ma_slope = is_god ? 49 : is_7000 ? 49 : i_len_ma_slope
+len_chop     = is_god ? 6 : is_7000 ? 6 : i_len_chop
+th_chop_high = is_god ? 72.8 : is_7000 ? 72.8 : i_th_chop_high
+th_chop_low  = is_god ? 34.2 : is_7000 ? 34.2 : i_th_chop_low
+
+// 2. Trend Parameters
+len_trend_ma = is_god ? 193 : is_7000 ? 193 : i_len_trend_ma
+v_len_channel = is_god ? 1 : is_7000 ? 1 : len_channel
+
+// 3. Risk Parameters
+risk_per_trade = is_god ? 1.5 : is_7000 ? 1.2 : i_risk_per_trade
+atr_len        = is_god ? 28 : is_7000 ? 26 : i_atr_len
+atr_mult_stop  = is_god ? 1.8 : is_7000 ? 1.9 : i_atr_mult_stop
+tp_rr          = is_god ? 1.2 : is_7000 ? 2.1 : i_tp_rr
+trail_atr_mult = is_7000 ? 2.8 : i_trail_atr_mult
+
+// 4. Confirmation & Filters
+// 4. Confirmation & Filters
+use_conf_htf = is_god ? false : is_7000 ? false : i_use_conf_htf
+htf_res      = i_htf_res
+
+// 5. Gann Filter Override
+v_gann_filter_mode = is_7000 ? "Strict" : gann_filter_mode
+
+// 6. Mean Reversion Overrides (for Contrarian Scalper)
+v_th_rsi_ob = th_rsi_ob
+v_th_rsi_os = th_rsi_os
+
+// 7. Smart Exits Override (Force OFF for 7000% and God Mode to restore baseline)
+v_use_smart_exits = (is_7000 or is_god) ? false : use_smart_exits
+
+// 8. Gann Style Override (Force Scalping for God Mode)
+v_gann_style = is_god ? "Scalping" : gann_style
+
+// 9. Trailing Stop Override (Force OFF for God Mode)
+v_use_trail = is_god ? false : use_trail
+
+// =============================================================================
+// 4. STORAGE (Ported from Gann Pro)
+// =============================================================================
+var PivotCandidate[] pDataArrayLow = array.new<PivotCandidate>(0)
+var PivotCandidate[] pDataArrayHigh = array.new<PivotCandidate>(0)
+
+var float winMaxPrice = -1.0e10
+var float winMinPrice = 1.0e10
+var int winBarCount = 0
+
+// Anti-repainting storage
+var int lastConfirmedBar = -1
+var AnchorPoint confirmedL1 = AnchorPoint.new(na, na, na, false)
+var AnchorPoint confirmedH1 = AnchorPoint.new(na, na, na, false)
+
+// =============================================================================
+// 5. GANN HELPERS & LOGIC
+// =============================================================================
+
+// Map Gann Style to Parameters (ASYMMETRIC PIVOTS)
+var int c_lookback = na
+var int c_pivot_left = na  // Structure (Significance)
+var int c_pivot_right = na // Speed (Confirmation)
+var int c_minDist = na
+var float c_slope = na
+
+if v_gann_style == "Scalping"
+    c_lookback := 300
+    c_pivot_left := 5
+    c_pivot_right := 2
+    c_minDist := 15
+    c_slope := 0.7
+else if v_gann_style == "Day Trading"
+    c_lookback := 600
+    c_pivot_left := 10
+    c_pivot_right := 3
+    c_minDist := 30
+    c_slope := 0.85
+else if v_gann_style == "Swing Trading"
+    c_lookback := 1200
+    c_pivot_left := 20
+    c_pivot_right := 20 // REVERTED: Was 5, back to 20 to match 7000% logic
+    c_minDist := 60
+    c_slope := 1.0
+else // Position
+    c_lookback := 2500
+    c_pivot_left := 40
+    c_pivot_right := 10
+    c_minDist := 120
+    c_slope := 1.2
+
+// Helper: Distance Check
+isFarEnough(int newIdx, int existingIdx, int minDist) => 
+    na(existingIdx) or math.abs(newIdx - existingIdx) >= minDist
+
+// Helper: Find Anchor
+findNextAnchor(AnchorPoint exclude1, AnchorPoint exclude2, float[] scores, PivotCandidate[] calcData, bool[] used, int minDist) =>
+    AnchorPoint res = AnchorPoint.new(na, na, na, false)
+    if array.size(scores) > 0
+        for s = 0 to array.size(scores) - 1
+            float tScore = array.get(scores, s)
+            for c = 0 to array.size(calcData) - 1
+                if not array.get(used, c)
+                    PivotCandidate cand = array.get(calcData, c)
+                    if math.abs(cand.score - tScore) < 1e-5
+                        bool d1 = isFarEnough(cand.idx, exclude1.idx, minDist)
+                        bool d2 = isFarEnough(cand.idx, exclude2.idx, minDist)
+                        if d1 and d2
+                            res.price := cand.price
+                            res.idx   := cand.idx
+                            res.vol   := cand.vol
+                            res.confirmed := true
+                            array.set(used, c, true)
+                        break
+            if not na(res.idx)
+                break
+    res
+
+// Helper: Regime Bias for Slope
+getSlopeBias(Regime r, float fanDir) =>
+    float bias = 1.0
+    if r.direction == 1 // Bullish
+        bias := fanDir > 0 ? 0.9 : 1.1
+    else if r.direction == -1 // Bearish
+        bias := fanDir > 0 ? 1.1 : 0.9
+    bias
+
+// =============================================================================
+// 6. GANN ENGINE (Per-Bar Calculation)
+// =============================================================================
+
+// Heikin Ashi for Pivots
+float haClose = (open + high + low + close) / 4
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2 : (haOpen[1] + haClose[1]) / 2
+float haHigh = math.max(high, math.max(haOpen, haClose))
+float haLow = math.min(low, math.min(haOpen, haClose))
+
+// Pivot Detection (ASYMMETRIC)
+int k = c_pivot_left
+int l = c_pivot_right
+pLow  = ta.pivotlow(haLow, k, l)
+pHigh = ta.pivothigh(haHigh, k, l)
+pIndex = bar_index - l
+
+float highestInLookback = ta.highest(haHigh, k)
+float lowestInLookback  = ta.lowest(haLow, k)
+float maxVolRecent      = ta.highest(volume, 100)
+float currentATR        = ta.atr(14)
+float ema50             = ta.ema(close, 50)
+
+// Window Logic
+int estimatedTimeDelta = c_lookback * timeframe.in_seconds() * 1000
+int autoStartTime = timenow - estimatedTimeDelta
+bool inWindow = time >= autoStartTime
+
+if inWindow
+    winMaxPrice := math.max(winMaxPrice, haHigh)
+    winMinPrice := math.min(winMinPrice, haLow)
+    winBarCount += 1
+    
+    float volFactor = (volume / (maxVolRecent == 0 ? 1 : maxVolRecent))
+
+    if barstate.isconfirmed
+        if not na(pLow)
+            float scoreLow = volFactor * (highestInLookback - pLow)
+            array.push(pDataArrayLow, PivotCandidate.new(pLow, pIndex, scoreLow, currentATR))
+            if array.size(pDataArrayLow) > 50
+                array.shift(pDataArrayLow)
+
+        if not na(pHigh)
+            float scoreHigh = volFactor * (pHigh - lowestInLookback)
+            array.push(pDataArrayHigh, PivotCandidate.new(pHigh, pIndex, scoreHigh, currentATR))
+            if array.size(pDataArrayHigh) > 50
+                array.shift(pDataArrayHigh)
+
+// Anchor Selection (Confirmed Bars Only)
+if barstate.isconfirmed and inWindow
+    // Low Anchors
+    if array.size(pDataArrayLow) > 0
+        PivotCandidate[] cLow = array.copy(pDataArrayLow)
+        float[] sLow = array.new_float(0)
+        for i = 0 to array.size(cLow) - 1
+            array.push(sLow, array.get(cLow, i).score)
+        array.sort(sLow, order.descending)
+        bool[] uLow = array.new_bool(array.size(cLow), false)
+        confirmedL1 := findNextAnchor(AnchorPoint.new(na,na,na,true), AnchorPoint.new(na,na,na,true), sLow, cLow, uLow, c_minDist)
+
+    // High Anchors
+    if array.size(pDataArrayHigh) > 0
+        PivotCandidate[] cHigh = array.copy(pDataArrayHigh)
+        float[] sHigh = array.new_float(0)
+        for i = 0 to array.size(cHigh) - 1
+            array.push(sHigh, array.get(cHigh, i).score)
+        array.sort(sHigh, order.descending)
+        bool[] uHigh = array.new_bool(array.size(cHigh), false)
+        confirmedH1 := findNextAnchor(AnchorPoint.new(na,na,na,true), AnchorPoint.new(na,na,na,true), sHigh, cHigh, uHigh, c_minDist)
+    
+    lastConfirmedBar := bar_index
+
+// Calculate Current Fan Levels
+float safeBars = math.max(winBarCount, 1)
+float calculatedBoxSlope = (winMaxPrice - winMinPrice) / safeBars
+float slopeVal = calculatedBoxSlope * c_slope
+
+// Gann Regime
+int dir = close > ema50 ? 1 : -1
+bool trending = math.abs(close - ema50) > (currentATR * 0.5)
+Regime gannRegime = Regime.new(dir, currentATR, trending)
+
+float biasLong = getSlopeBias(gannRegime, 1.0)
+float biasShort = getSlopeBias(gannRegime, -1.0)
+float slopeLong = slopeVal * biasLong
+float slopeShort = slopeVal * biasShort
+
+// Project Fan Lines to Current Bar
+float gann_support_l1 = na
+float gann_resistance_h1 = na
+
+if not na(confirmedL1.idx)
+    gann_support_l1 := confirmedL1.price + (slopeLong * 1.0 * (bar_index - confirmedL1.idx))
+
+if not na(confirmedH1.idx)
+    gann_resistance_h1 := confirmedH1.price + (slopeShort * -1.0 * (bar_index - confirmedH1.idx))
+
+// =============================================================================
+// 6B. CHANNEL AWARENESS MODULE
+// =============================================================================
+
+// Calculate Channel State
+float channel_upper = na
+float channel_lower = na
+float channel_position = 0.5  // 0 = bottom, 0.5 = middle, 1.0 = top
+string channel_state = "middle"
+bool in_defined_channel = false
+bool breaking_channel_up = false
+bool breaking_channel_down = false
+
+// Determine channel boundaries
+if not na(gann_support_l1) and not na(gann_resistance_h1)
+    channel_upper := gann_resistance_h1
+    channel_lower := gann_support_l1
+    in_defined_channel := true
+    
+    // Calculate position within channel (0-1 scale)
+    float channel_width = channel_upper - channel_lower
+    if channel_width > 0
+        channel_position := (close - channel_lower) / channel_width
+        channel_position := math.max(0, math.min(1, channel_position))  // Clamp to 0-1
+        
+        // Classify channel state
+        if channel_position >= channel_position_threshold
+            channel_state := "upper_third"
+        else if channel_position <= (1.0 - channel_position_threshold)
+            channel_state := "lower_third"
+        else
+            channel_state := "middle"
+    
+    // Detect channel breakouts
+    breaking_channel_up := close > channel_upper
+    breaking_channel_down := close < channel_lower
+else if not na(gann_support_l1) and na(gann_resistance_h1)
+    // Only support line available
+    channel_lower := gann_support_l1
+    breaking_channel_down := close < channel_lower
+else if not na(gann_resistance_h1) and na(gann_support_l1)
+    // Only resistance line available
+    channel_upper := gann_resistance_h1
+    breaking_channel_up := close > channel_upper
+
+// Track consolidation (bars spent in channel)
+var int bars_in_channel = 0
+var int bars_out_of_channel = 0
+
+if in_defined_channel and not breaking_channel_up and not breaking_channel_down
+    bars_in_channel += 1
+    bars_out_of_channel := 0
+else
+    bars_out_of_channel += 1
+    if bars_out_of_channel > 3  // Reset if out for more than 3 bars
+        bars_in_channel := 0
+
+bool is_consolidating = bars_in_channel >= min_bars_in_channel
+
+// =============================================================================
+// 6C. ANTI-WHIPSAW DETECTION MODULE
+// =============================================================================
+
+// 1. BB Squeeze Detection (Volatility Contraction)
+[bb_mid_whipsaw, bb_upper_whipsaw, bb_lower_whipsaw] = ta.bb(close, 20, 2.0)
+float bb_width = (bb_upper_whipsaw - bb_lower_whipsaw) / bb_mid_whipsaw
+float bb_width_percentile = ta.percentrank(bb_width, 100)
+bool is_bb_squeeze = bb_width_percentile < bb_squeeze_threshold
+
+// 2. Resistance/Support Rejection Memory
+// Track recent pivot highs and lows
+var float[] recent_pivot_highs = array.new_float(0)
+var float[] recent_pivot_lows = array.new_float(0)
+
+// Detect pivots (using symmetric 3,3 for clean detection)
+float pivot_high_detected = ta.pivothigh(high, 3, 3)
+float pivot_low_detected = ta.pivotlow(low, 3, 3)
+
+// Store pivots (confirmed bars only)
+if barstate.isconfirmed
+    if not na(pivot_high_detected)
+        array.push(recent_pivot_highs, pivot_high_detected)
+        if array.size(recent_pivot_highs) > 10
+            array.shift(recent_pivot_highs)
+            
+    if not na(pivot_low_detected)
+        array.push(recent_pivot_lows, pivot_low_detected)
+        if array.size(recent_pivot_lows) > 10
+            array.shift(recent_pivot_lows)
+
+// Count rejections near current price (within 1% tolerance)
+int resistance_rejections = 0
+int support_bounces = 0
+float rejection_tolerance = close * 0.01
+
+if array.size(recent_pivot_highs) > 0
+    for i = 0 to array.size(recent_pivot_highs) - 1
+        float pivot_price = array.get(recent_pivot_highs, i)
+        if math.abs(pivot_price - close) < rejection_tolerance
+            resistance_rejections += 1
+        
+if array.size(recent_pivot_lows) > 0
+    for i = 0 to array.size(recent_pivot_lows) - 1
+        float pivot_price = array.get(recent_pivot_lows, i)
+        if math.abs(pivot_price - close) < rejection_tolerance
+            support_bounces += 1
+
+bool is_failed_resistance_breakout = resistance_rejections >= rejection_count_trigger
+bool is_failed_support_breakdown = support_bounces >= rejection_count_trigger
+
+// 3. ATR Compression Detection
+float current_atr_whipsaw = ta.atr(14)
+float avg_atr_whipsaw = ta.sma(current_atr_whipsaw, 20)
+float atr_ratio = avg_atr_whipsaw > 0 ? (current_atr_whipsaw / avg_atr_whipsaw) : 1.0
+bool is_atr_compressed = atr_ratio < atr_compression_ratio
+
+// Combined Whipsaw Flags
+bool is_whipsaw_environment = is_bb_squeeze or is_atr_compressed
+bool is_whipsaw_long = is_whipsaw_environment or is_failed_resistance_breakout
+bool is_whipsaw_short = is_whipsaw_environment or is_failed_support_breakdown
+
+
+// =============================================================================
+// 7. NEXT-GEN MODULES (Regime, Trend, etc.)
+// =============================================================================
+
+// Module A: Regime Classifier
+calculateRegime() =>
+    [di_plus, di_minus, adx] = ta.dmi(len_adx, len_adx)
+    ma = ta.sma(close, len_ma_slope)
+    ma_slope = (ma - ma[1]) / syminfo.mintick
+    score_adx = math.min(100, (adx / 50) * 100)
+    score_slope = math.min(100, (math.abs(ma_slope) / th_ma_slope) * 100)
+    internal_trend_score = (score_adx + score_slope) / 2
+    ci = 100 * math.log10(math.sum(ta.atr(1), len_chop) / (ta.highest(len_chop) - ta.lowest(len_chop))) / math.log10(len_chop)
+    internal_range_score = 0.0
+    if ci > th_chop_high
+        internal_range_score := 100.0
+    else if ci < th_chop_low
+        internal_range_score := 0.0
+    else
+        internal_range_score := ((ci - th_chop_low) / (th_chop_high - th_chop_low)) * 100
+    [bb_mid, bb_upper, bb_lower] = ta.bb(close, 20, 2.0)
+    regime_bb_width = (bb_upper - bb_lower) / bb_mid
+    is_squeeze = regime_bb_width < ta.lowest(regime_bb_width, 20)[1]
+    is_high_vol = regime_bb_width > ta.highest(regime_bb_width, 20)[1]
+    
+    // BREAKOUT GUARD (New)
+    is_bb_expanding = regime_bb_width > regime_bb_width[1] * 1.1
+    is_adx_rising = adx > adx[1] + 2
+    is_breakout_threat = is_bb_expanding or is_adx_rising
+    
+    [internal_trend_score, internal_range_score, is_squeeze, is_high_vol, is_breakout_threat, adx]
+
+[regime_trend_score, regime_range_score, is_squeeze, is_high_vol, is_breakout_threat, raw_adx] = calculateRegime()
+// Old regime flags removed - will be defined after Advanced Regime calculation to ensure consistency
+
+
+// --- Advanced Multi-State Regime Model ---
+calculateAdvancedRegime(float input_adx) =>
+    // State 1: Low Vol Grind (Range)
+    // State 2: Trending with Normal Vol
+    // State 3: High Vol Breakout
+    // State 4: Crisis/Crash (avoid)
+    
+    float vol_1 = ta.stdev(close, 20)
+    float vol_2 = ta.stdev(close, 50)
+    float vol_ratio = vol_2 != 0 ? vol_1 / vol_2 : 1.0
+    
+    // Detect regime
+    int regime_state = 0
+    
+    // 1. Low Volatility / Compression -> Mean Reversion
+    if vol_ratio < 0.8
+        regime_state := 1
+        
+    // 2. Normal Volatility -> Check Trend Strength
+    else if vol_ratio >= 0.8 and vol_ratio < 1.5
+        if input_adx > 25
+            regime_state := 2 // Trending
+        else
+            regime_state := 1 // Ranging / Noise
+            
+    // 3. High Volatility -> Breakout or Strong Trend
+    else if vol_ratio >= 1.5 and vol_ratio < 2.5
+        regime_state := 3 // Breakout
+        
+    // 4. Extreme Volatility -> Chaos
+    else
+        regime_state := 4 // Chaos
+    
+    [regime_state, vol_ratio]
+
+[market_state, vol_ratio_value] = calculateAdvancedRegime(raw_adx)
+
+// Sync legacy flags with new Advanced Regime
+is_trend_regime = (market_state == 2 or market_state == 3)
+is_range_regime = (market_state == 1)
+
+// Module B: Trend Engine
+calculateTrendEngine() =>
+    trend_ma = ta.sma(close, len_trend_ma)
+    upper_ch = ta.highest(high, v_len_channel)[1]
+    lower_ch = ta.lowest(low, v_len_channel)[1]
+    is_bull_candle = close > open
+    is_bear_candle = close < open
+    [di_plus, di_minus, adx] = ta.dmi(len_adx, len_adx)
+    is_trend_strong = adx > th_adx_trend
+    sig_breakout_long = close > upper_ch
+    sig_breakout_short = close < lower_ch
+    dist_to_ma = math.abs(low - trend_ma) / trend_ma
+    is_near_ma = dist_to_ma < 0.005
+    sig_pullback_long = close > trend_ma and is_near_ma and is_bull_candle and is_trend_strong
+    sig_pullback_short = close < trend_ma and (math.abs(high - trend_ma)/trend_ma < 0.005) and is_bear_candle and is_trend_strong
+    [sig_breakout_long or sig_pullback_long, sig_breakout_short or sig_pullback_short, trend_ma]
+
+[trend_signal_long, trend_signal_short, trend_ma] = calculateTrendEngine()
+
+// Module C: Mean Reversion
+calculateMeanReversionEngine() =>
+    [bb_mid, bb_upper, bb_lower] = ta.bb(close, len_bb, mult_bb)
+    rsi = ta.rsi(close, len_rsi)
+    sig_rev_long = low < bb_lower and rsi < v_th_rsi_os
+    sig_rev_short = high > bb_upper and rsi > v_th_rsi_ob
+    [sig_rev_long, sig_rev_short]
+
+[rev_signal_long, rev_signal_short] = calculateMeanReversionEngine()
+
+// Module D: Risk
+// Module D: Risk & Safety Shield
+// Global Safety Shield Tracking
+var float account_max_equity = 0.0
+account_max_equity := math.max(account_max_equity, strategy.equity)
+float current_drawdown_pct = (account_max_equity > 0) ? ((account_max_equity - strategy.equity) / account_max_equity * 100) : 0.0
+// --- Kelly Position Sizing Helpers ---
+calculateKellyPosition(float win_rate, float avg_win, float avg_loss) =>
+    float kelly_fraction = 0.0
+    if avg_loss > 0
+        float b = avg_win / avg_loss
+        float p = win_rate / 100
+        float q = 1 - p
+        kelly_fraction := (b * p - q) / b
+    // fractional Kelly 25%-50%
+    kelly_fraction := math.max(0, math.min(kelly_fraction * 0.25, 0.5))
+    kelly_fraction
+
+// Track live trade statistics (global vars)
+var int total_trades = 0
+var int winning_trades = 0
+var float sum_wins = 0.0
+var float sum_losses = 0.0
+
+// Update trade statistics (must be in global scope, not in function)
+if strategy.closedtrades > total_trades
+    total_trades := strategy.closedtrades
+    float last_pnl = strategy.closedtrades.profit(total_trades - 1)
+    if last_pnl > 0
+        winning_trades := winning_trades + 1
+        sum_wins := sum_wins + last_pnl
+    else
+        sum_losses := sum_losses + math.abs(last_pnl)
+
+calculateRisk(float sl_dist) =>
+    float qty_size = 0.0
+    
+    // BOOTSTRAP PHASE: Use Fixed % Risk until we have 20+ trades for Kelly
+    if total_trades < 20
+        // Fixed Risk: Risk X% of equity per trade (from user input)
+        float risk_amt = strategy.equity * (risk_per_trade / 100)
+        float safe_sl = math.max(sl_dist, syminfo.mintick)
+        qty_size := risk_amt / safe_sl
+    else
+        // KELLY PHASE: Use Kelly Criterion once we have sufficient data
+        float current_win_rate = (winning_trades / total_trades * 100)
+        float avg_win = winning_trades > 0 ? (sum_wins / winning_trades) : 1
+        float avg_loss = (total_trades - winning_trades) > 0 ? (sum_losses / (total_trades - winning_trades)) : 1
+        
+        float kelly_frac = calculateKellyPosition(current_win_rate, avg_win, avg_loss)
+        float risk_amt = strategy.equity * kelly_frac
+        float safe_sl = math.max(sl_dist, syminfo.mintick)
+        qty_size := risk_amt / safe_sl
+    
+    // Safety Shield: Max Leverage Cap
+    if use_safety_shield
+        float max_position_value = strategy.equity * max_leverage_cap
+        float max_qty_allowed = max_position_value / close
+        qty_size := math.min(qty_size, max_qty_allowed)
+    
+    // Apply user-defined leverage multiplier
+    qty_size := qty_size * i_leverage
+
+    // Weekend Volatility Adjustment (Crypto Gap Risk)
+    bool is_weekend = dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday
+    if is_weekend
+        qty_size := qty_size * weekend_vol_mult
+    
+    qty_size
+
+// Module E: Confirmation
+calculateConfirmation() =>
+    vol_ma = ta.sma(volume, len_vol_ma)
+    is_vol_valid = not use_conf_vol or (volume > vol_ma)
+    htf_close = request.security(syminfo.tickerid, htf_res, close, lookahead=barmerge.lookahead_off)
+    htf_ma = request.security(syminfo.tickerid, htf_res, ta.sma(close, 200), lookahead=barmerge.lookahead_off)
+    is_htf_uptrend = htf_close > htf_ma
+    is_htf_downtrend = htf_close < htf_ma
+    is_htf_valid_long = not use_conf_htf or is_htf_uptrend
+    is_htf_valid_short = not use_conf_htf or is_htf_downtrend
+    
+    // HTF Consensus (Smart Exits)
+    [htf_di_plus, htf_di_minus, htf_adx] = request.security(syminfo.tickerid, htf_res, ta.dmi(14, 14), lookahead=barmerge.lookahead_off)
+    
+    [is_vol_valid, is_htf_valid_long, is_htf_valid_short, htf_adx, is_htf_uptrend, is_htf_downtrend]
+
+[conf_vol, conf_htf_long, conf_htf_short, htf_adx_val, htf_uptrend, htf_downtrend] = calculateConfirmation()
+
+// =============================================================================
+// 9. MODULE F: GOLDEN RATIO ZONE-BASED FILTER
+// =============================================================================
+
+// Fetch Daily Data
+daily_close = request.security(syminfo.tickerid, golden_ratio_res, close, lookahead=barmerge.lookahead_off)
+daily_sma111 = request.security(syminfo.tickerid, golden_ratio_res, ta.sma(close, golden_sma_fast), lookahead=barmerge.lookahead_off)
+daily_sma350 = request.security(syminfo.tickerid, golden_ratio_res, ta.sma(close, golden_sma_slow), lookahead=barmerge.lookahead_off)
+
+// Calculate Multiplier Levels
+golden_base = daily_sma350
+golden_x0702 = golden_base * 0.702  // Bottom Support
+golden_x1000 = golden_base * 1.0    // Base Level
+golden_x1618 = golden_base * 1.618  // Golden Ratio (Warning Zone Start)
+golden_x2000 = golden_base * 2.0    // Danger Zone
+golden_x3000 = golden_base * 3.0    // Extreme Euphoria
+golden_x5000 = golden_base * 5.0    // Parabolic Top
+
+// Zone Classification
+int zone = 0
+if daily_close > golden_x5000
+    zone := 6  // Parabolic (EXTREME RED FLAG)
+else if daily_close > golden_x3000
+    zone := 5  // Euphoria (VERY DANGEROUS)
+else if daily_close > golden_x2000
+    zone := 4  // Danger (RISKY)
+else if daily_close > golden_x1618
+    zone := 3  // Warning (CAUTION)
+else if daily_close > golden_x1000
+    zone := 2  // Normal (SAFE)
+else if daily_close > golden_x0702
+    zone := 1  // Undervalued (OPPORTUNITY)
+else
+    zone := 0  // Deep Bottom (EXTREME OPPORTUNITY)
+
+// Momentum Filter (Catches Tops Before Reversal)
+daily_roc7 = request.security(syminfo.tickerid, golden_ratio_res, ta.roc(close, 7), lookahead=barmerge.lookahead_off)
+daily_rsi = request.security(syminfo.tickerid, golden_ratio_res, ta.rsi(close, 14), lookahead=barmerge.lookahead_off)
+price_extension = ((daily_close - golden_base) / golden_base) * 100
+is_losing_momentum = daily_roc7 < daily_roc7[1] and price_extension > 61.8
+is_rsi_divergence = daily_close > golden_x2000 and daily_rsi < daily_rsi[1] // Crash Signal: High Price + Falling RSI
+
+// Initialize outputs
+bool golden_filter_long = true
+bool golden_filter_short = true
+float golden_risk_mult = 1.0
+
+if use_golden_ratio
+    // === APPROACH 1: HARD FILTER ===
+    if golden_approach == "Hard Filter"
+        if golden_mode == "Conservative"
+            // Block longs above Golden Ratio (1.618x)
+            golden_filter_long := zone <= 2
+        else if golden_mode == "Moderate"
+            // Block longs above 1.618x
+            golden_filter_long := zone <= 2
+        else // Aggressive
+            // Only block longs in extreme zones (2x+)
+            golden_filter_long := zone <= 3
+        
+        // Momentum Override: Block ALL longs if losing momentum near top
+        if use_momentum_filter and (is_losing_momentum or is_rsi_divergence) and zone >= 3
+            golden_filter_long := false
+        
+        // Block shorts in bottom zones
+        if zone <= 1
+            golden_filter_short := false
+    
+    // === APPROACH 2: RISK SCALING ===
+    else // Risk Scaling
+        // Never block trades, just scale position size
+        golden_filter_long := true
+        golden_filter_short := true
+        
+        // Calculate risk multiplier based on zone
+        if zone >= 5      // Parabolic
+            golden_risk_mult := 0.0  // No longs (100% reduction)
+        else if zone == 4 // Danger (2x-3x)
+            golden_risk_mult := 0.3  // 70% reduction
+        else if zone == 3 // Warning (1.618x-2x)
+            golden_risk_mult := 0.6  // 40% reduction
+        else if zone == 2 // Normal
+            golden_risk_mult := 1.0  // Normal size
+        else if zone == 1 // Undervalued
+            golden_risk_mult := 1.3  // 30% increase
+        else // Deep Bottom (zone 0)
+            golden_risk_mult := 1.5  // 50% increase
+        
+        // Momentum Override: Force 0 risk if losing momentum
+        if use_momentum_filter and (is_losing_momentum or is_rsi_divergence) and zone >= 3
+            golden_risk_mult := 0.0
+
+// =============================================================================
+// 8. UNIFIED CORE & EXECUTION
+// =============================================================================
+
+// 1. Raw Signals (with Channel Awareness)
+// 1. Raw Signals (with Channel Awareness)
+raw_long = false
+raw_short = false
+
+// Adapt strategy per regime
+if market_state == 1
+    // Use ONLY mean reversion
+    raw_long := rev_signal_long
+    raw_short := rev_signal_short
+else if market_state == 2
+    // Use ONLY trend following
+    raw_long := trend_signal_long
+    raw_short := trend_signal_short
+else if market_state == 3
+    // Use breakout logic (both can fire)
+    raw_long := trend_signal_long or (rev_signal_long and breaking_channel_up)
+    raw_short := trend_signal_short or (rev_signal_short and breaking_channel_down)
+else
+    // CRISIS MODE: No trades
+    raw_long := false
+    raw_short := false
+
+
+// Consolidation RSI Filter (additional confluence requirement)
+// Calculate RSI on every bar for Pine Script consistency
+rsi_current = ta.rsi(close, len_rsi)
+if use_channel_filter and is_consolidating and require_extreme_rsi_in_consolidation
+    if rsi_current > 25 and rsi_current < 75
+        raw_long := false
+        raw_short := false
+
+// 2. Gann Filter (The "Respect" Logic)
+bool gann_filter_long = true
+bool gann_filter_short = true
+
+if v_gann_filter_mode != "None"
+    float buffer = close * (gann_buffer_pct / 100.0)
+    
+    // Block Longs if right below Resistance (H1)
+    if not na(gann_resistance_h1)
+        // If price is just below resistance (within buffer)
+        if close < gann_resistance_h1 and close > (gann_resistance_h1 - buffer)
+            gann_filter_long := false
+            
+    // Block Shorts if right above Support (L1)
+    if not na(gann_support_l1)
+        // If price is just above support (within buffer)
+        if close > gann_support_l1 and close < (gann_support_l1 + buffer)
+            gann_filter_short := false
+
+// 2b. Time Intelligence Filter
+bool is_tradeable_hour = true
+if avoid_low_volume_hours
+    int hour_utc = hour(time, "UTC")
+    // Crypto: Block dead zone
+    if syminfo.type == "crypto"
+        is_tradeable_hour := hour_utc >= 6 and hour_utc <= 23
+    // Stocks: Block pre-market/after-hours
+    else
+        is_tradeable_hour := hour_utc >= 14 and hour_utc <= 21  // 10am-4pm ET
+
+// 3. Final Signal (with Golden Ratio Filter & Time Intelligence)
+final_long = raw_long and conf_vol and conf_htf_long and gann_filter_long and golden_filter_long and is_tradeable_hour
+final_short = raw_short and conf_vol and conf_htf_short and gann_filter_short and golden_filter_short and is_tradeable_hour
+
+// =============================================================================
+// 10. RECOVERY PROTOCOL (Safety Shield Add-on)
+// =============================================================================
+var bool in_recovery_mode = false
+float recovery_risk_mult = 1.0
+
+// Trigger Recovery Mode if Drawdown > 10%
+if current_drawdown_pct > 10
+    in_recovery_mode := true
+
+// Exit Recovery Mode if Drawdown recovers to < 5%
+if in_recovery_mode and current_drawdown_pct < 5
+    in_recovery_mode := false
+
+if in_recovery_mode
+    // Reduce risk by 50%
+    recovery_risk_mult := 0.5
+    // Force A+ Setups (Require ALL confirmations)
+    final_long := final_long and conf_vol and conf_htf_long and gann_filter_long and golden_filter_long and is_liquid
+    final_short := final_short and conf_vol and conf_htf_short and gann_filter_short and golden_filter_short and is_liquid
+
+// =============================================================================
+// 11. CORRELATION FILTER (Systemic Risk)
+// =============================================================================
+// Get correlation asset data
+string corr_symbol = correlation_asset == "BTC" ? "BINANCE:BTCUSDT" : 
+                     correlation_asset == "ETH" ? "BINANCE:ETHUSDT" : "SP:SPX"
+
+corr_close = request.security(corr_symbol, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+corr_returns = ta.change(corr_close) / corr_close[1]
+asset_returns = ta.change(close) / close[1]
+
+// Calculate rolling correlation
+float correlation = ta.correlation(asset_returns, corr_returns, 50)
+
+// Block trades during high correlation (everything moves together = systemic risk)
+bool is_high_correlation = not na(correlation) and math.abs(correlation) > 0.85
+
+if use_correlation_filter and is_high_correlation
+    // In high correlation regimes, diversification fails
+    // Only trade with macro trend, never counter-trend
+    if correlation > 0  // Positive correlation
+        if corr_returns < 0  // If BTC/SPY dumping
+            final_long := false  // Don't catch falling knives
+    else  // Negative correlation (rare)
+        if corr_returns > 0
+            final_short := false
+
+// =============================================================================
+// 12. INSTITUTIONAL ANCHORS (VWAP)
+// =============================================================================
+// Function to calculate VWAP resetting on condition
+f_anchored_vwap(condition) =>
+    var float sumSrcVol = 0.0
+    var float sumVol = 0.0
+    if condition
+        sumSrcVol := 0.0
+        sumVol := 0.0
+    sumSrcVol += close * volume
+    sumVol += volume
+    sumSrcVol / sumVol
+
+// Detect start of week and month
+is_new_week = timeframe.change("W")
+is_new_month = timeframe.change("M")
+
+vwap_weekly = f_anchored_vwap(is_new_week)
+vwap_monthly = f_anchored_vwap(is_new_month)
+
+// VWAP Filter Logic
+bool vwap_filter_long = true
+bool vwap_filter_short = true
+
+if use_vwap_anchors
+    float v_buffer = close * (vwap_buffer_pct / 100.0)
+    
+    // Block Longs if right below VWAP (Resistance)
+    if (close < vwap_weekly and close > (vwap_weekly - v_buffer)) or (close < vwap_monthly and close > (vwap_monthly - v_buffer))
+        vwap_filter_long := false
+        
+    // Block Shorts if right above VWAP (Support)
+    if (close > vwap_weekly and close < (vwap_weekly + v_buffer)) or (close > vwap_monthly and close < (vwap_monthly + v_buffer))
+        vwap_filter_short := false
+
+// Apply to final signals
+final_long := final_long and vwap_filter_long
+final_short := final_short and vwap_filter_short
+
+// Plot Anchors
+plot(use_vwap_anchors ? vwap_weekly : na, "Weekly VWAP", color=color.new(color.orange, 30), linewidth=1, style=plot.style_circles)
+plot(use_vwap_anchors ? vwap_monthly : na, "Monthly VWAP", color=color.new(color.purple, 30), linewidth=2)
+
+// =============================================================================
+// 13. ECONOMIC CALENDAR (News Filter)
+// =============================================================================
+// Time conversion to New York Time (ET)
+float t_ny_hour = hour(time, "America/New_York")
+float t_ny_minute = minute(time, "America/New_York")
+int t_ny_dow = dayofweek(time, "America/New_York")
+int t_ny_dom = dayofmonth(time, "America/New_York")
+
+// 1. NFP Logic: 1st Friday of Month, 8:30 AM ET
+// Block window: 08:00 - 09:00 ET
+bool is_nfp_day = t_ny_dow == dayofweek.friday and t_ny_dom <= 7
+bool is_nfp_window = is_nfp_day and t_ny_hour == 8
+
+// 2. FOMC Logic: Wednesdays, 14:00 ET
+// Block window: 13:30 - 14:30 ET
+bool is_fomc_day = t_ny_dow == dayofweek.wednesday
+bool is_fomc_window = is_fomc_day and ((t_ny_hour == 13 and t_ny_minute >= 30) or (t_ny_hour == 14 and t_ny_minute <= 30))
+
+// 3. Data Drop Logic (CPI/PPI/GDP): Daily 8:30 AM ET
+// Block window: 08:00 - 09:00 ET
+bool is_data_window = t_ny_hour == 8
+
+// Combine Filters
+bool news_block = false
+if filter_nfp and is_nfp_window
+    news_block := true
+if filter_fomc and is_fomc_window
+    news_block := true
+if filter_data_drops and is_data_window
+    news_block := true
+
+// Apply to final signals
+final_long := final_long and not news_block
+final_short := final_short and not news_block
+
+
+
+// Apply Wash Trading Filter
+if use_wash_filter and is_spoofed
+    final_long := false
+    final_short := false
+
+// =============================================================================
+// 15. CIRCUIT BREAKER (Max Consecutive Losses)
+// =============================================================================
+var int consecutive_losses = 0
+if strategy.closedtrades > 0
+    float last_pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    // Update only on new trade close
+    if strategy.closedtrades > strategy.closedtrades[1]
+        consecutive_losses := last_pnl < 0 ? consecutive_losses + 1 : 0
+
+// Stop trading after 4 straight losses (your model is broken)
+if consecutive_losses >= 4
+    final_long := false
+    final_short := false
+
+// 4. Execution
+atr = ta.atr(atr_len)
+sl_dist = atr * atr_mult_stop
+tp_dist = sl_dist * tp_rr
+
+// --- SMART EXITS LOGIC ---
+// 1. Regime Hysteresis (Noise Filter)
+// Require 3 bars of "Range" to kill a "Trend" trade
+var int range_counter = 0
+if is_range_regime
+    range_counter += 1
+else
+    range_counter := 0
+    
+is_confirmed_range = v_use_smart_exits ? (range_counter >= 3) : is_range_regime
+
+// 2. HTF Consensus (The Boss)
+// If HTF is Trending Strong, IGNORE local regime exit
+is_htf_trending = htf_adx_val > 25
+should_ignore_regime_exit = v_use_smart_exits and is_htf_trending
+
+// 3. Dynamic Trailing (Momentum Based)
+float dynamic_trail_mult = trail_atr_mult
+if v_use_smart_exits
+    if raw_adx > 30 // Strong Trend
+        dynamic_trail_mult := 4.0 // Loosen Stop
+    else if raw_adx < 20 // Weak Trend
+        dynamic_trail_mult := 1.5 // Tighten Stop
+
+var bool prev_was_trend = false
+var bool prev_was_range = false
+
+if use_regime_exit and not should_ignore_regime_exit
+    // Use "is_confirmed_range" instead of raw "is_range_regime" for Hysteresis
+    if strategy.position_size > 0 and prev_was_trend and not is_trend_regime
+        // For Trend->Range switch, we use the Hysteresis check
+        if is_confirmed_range
+            strategy.close_all(comment="Regime Exit (Confirmed)")
+            
+    if strategy.position_size < 0 and prev_was_trend and not is_trend_regime
+        if is_confirmed_range
+            strategy.close_all(comment="Regime Exit (Confirmed)")
+
+    // For Range->Trend switch, we usually want to exit immediately (Breakout Guard handles entry)
+    if strategy.position_size > 0 and prev_was_range and not is_range_regime
+        strategy.close_all(comment="Regime Exit")
+    if strategy.position_size < 0 and prev_was_range and not is_range_regime
+        strategy.close_all(comment="Regime Exit")
+
+prev_was_trend := is_trend_regime
+prev_was_range := is_range_regime
+
+if final_long
+    qty_l = calculateRisk(sl_dist) * golden_risk_mult * recovery_risk_mult // Apply zone-based & recovery scaling
+    if use_limit_orders
+        // Place limit buy BELOW current price (get filled on pullback)
+        float limit_price = close * (1 - limit_offset_pct / 100)
+        strategy.entry("Long", strategy.long, qty=qty_l, limit=limit_price)
+    else
+        strategy.entry("Long", strategy.long, qty=qty_l)
+    strategy.exit("Exit Long", "Long", stop=close - sl_dist, limit=close + tp_dist)
+
+if final_short
+    qty_s = calculateRisk(sl_dist) * golden_risk_mult * recovery_risk_mult // Apply zone-based & recovery scaling
+    if use_limit_orders
+        // Place limit sell ABOVE current price (get filled on pullback)
+        float limit_price = close * (1 + limit_offset_pct / 100)
+        strategy.entry("Short", strategy.short, qty=qty_s, limit=limit_price)
+    else
+        strategy.entry("Short", strategy.short, qty=qty_s)
+    strategy.exit("Exit Short", "Short", stop=close + sl_dist, limit=close - tp_dist)
+
+// Track extremes for Chandelier Exit
+var float trade_highest = na
+var float trade_lowest = na
+
+if strategy.position_size == 0
+    trade_highest := na
+    trade_lowest := na
+else if strategy.position_size > 0
+    trade_highest := na(trade_highest) ? high : math.max(trade_highest, high)
+else
+    trade_lowest := na(trade_lowest) ? low : math.min(trade_lowest, low)
+
+if v_use_trail
+    if strategy.position_size > 0
+        // Chandelier Exit: Highest High - ATR * Mult
+        float chandelier_stop_l = trade_highest - (atr * dynamic_trail_mult)
+        var float active_sl_l = na
+        
+        if final_long
+            active_sl_l := close - sl_dist
+            
+        if not na(active_sl_l)
+            // Ratchet up: Stop can only move up
+            active_sl_l := math.max(active_sl_l, chandelier_stop_l)
+            strategy.exit("Exit Long", "Long", stop=active_sl_l, limit=strategy.position_avg_price + (sl_dist * tp_rr))
+
+    if strategy.position_size < 0
+        // Chandelier Exit: Lowest Low + ATR * Mult
+        float chandelier_stop_s = trade_lowest + (atr * dynamic_trail_mult)
+        var float active_sl_s = na
+        
+        if final_short
+            active_sl_s := close + sl_dist
+            
+        if not na(active_sl_s)
+            // Ratchet down: Stop can only move down
+            active_sl_s := math.min(active_sl_s, chandelier_stop_s)
+            strategy.exit("Exit Short", "Short", stop=active_sl_s, limit=strategy.position_avg_price - (sl_dist * tp_rr))
+
+// =============================================================================
+// 9. VISUALS (MINIMALIST THEME)
+// =============================================================================
+
+// Colors
+c_neon_cyan    = #00FFFF
+c_neon_magenta = #FF00FF
+c_neon_green   = #00FF00
+c_neon_red     = #FF3333
+c_neon_gold    = #FFD700
+
+// Lines (Trend MA Only)
+plot(trend_ma, "Trend MA", color=is_trend_regime ? c_neon_gold : color.gray, linewidth=2)
+
+// === CUSTOM TRADE LABELS (Entry/Exit Prices) ===
+// Toggle Controls
+show_signals = input.bool(true, "Show Entry Signals", group="🎨 Visuals")
+show_exits = input.bool(true, "Show Exit Signals", group="🎨 Visuals")
+show_labels = input.bool(true, "Show Price Labels", group="🎨 Visuals")
+
+// Detect position changes
+var float last_position = 0.0
+bool is_long = strategy.position_size > 0
+bool is_short = strategy.position_size < 0
+bool was_long = last_position > 0
+bool was_short = last_position < 0
+
+// 1. Entry Signals (Circles)
+plotshape(show_signals and final_long, "LONG", shape.circle, location.belowbar, color.new(#00D9FF, 0), size=size.small)
+plotshape(show_signals and final_short, "SHORT", shape.circle, location.abovebar, color.new(#FF006E, 0), size=size.small)
+
+// 2. Price Labels (Entry & Exit)
+if show_labels
+    // Detect Exits (Closed or Flipped)
+    if ((was_long and not is_long) or (was_long and is_short)) and strategy.closedtrades > 0
+        float px = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+        label.new(bar_index, px, "Exit: " + str.tostring(px, format.mintick), style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.small)
+
+    if ((was_short and not is_short) or (was_short and is_long)) and strategy.closedtrades > 0
+        float px = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+        label.new(bar_index, px, "Exit: " + str.tostring(px, format.mintick), style=label.style_label_up, color=color.new(color.gray, 20), textcolor=color.white, size=size.small)
+
+    // Detect Entries (Opened or Flipped)
+    if ((not was_long and is_long) or (was_short and is_long))
+        float px = strategy.position_avg_price
+        label.new(bar_index, px, "Entry: " + str.tostring(px, format.mintick), style=label.style_label_up, color=color.new(#00D9FF, 20), textcolor=color.white, size=size.small)
+
+    if ((not was_short and is_short) or (was_long and is_short))
+        float px = strategy.position_avg_price
+        label.new(bar_index, px, "Entry: " + str.tostring(px, format.mintick), style=label.style_label_down, color=color.new(#FF006E, 20), textcolor=color.white, size=size.small)
+
+last_position := strategy.position_size
+
+// Display margin setting reminder
+if barstate.islastconfirmedhistory
+    required_margin = 100 / i_leverage
+    margin_text = "⚙️ Set Margin Long/Short to: " + str.tostring(required_margin, "#.##") + "%"
+    label.new(bar_index, high, margin_text, style=label.style_label_down, color=color.new(color.orange, 30), textcolor=color.white, size=size.normal, tooltip="Go to Strategy Properties → Set both 'Margin for long positions' and 'Margin for short positions' to this value")
+
+// =============================================================================
+// PERFORMANCE METRICS TABLE
+// =============================================================================
+if barstate.islastconfirmedhistory
+    // Calculate real performance metrics
+    float max_dd = 0.0
+    float running_peak = strategy.initial_capital
+    
+    for i = 0 to strategy.closedtrades - 1
+        float trade_equity = strategy.initial_capital + strategy.closedtrades.profit(i)
+        running_peak := math.max(running_peak, trade_equity)
+        float dd = running_peak > 0 ? (running_peak - trade_equity) / running_peak * 100 : 0.0
+        max_dd := math.max(max_dd, dd)
+    
+    // Sharpe Ratio approximation
+    float avg_trade = strategy.closedtrades > 0 ? strategy.grossprofit / strategy.closedtrades : 0.0
+    float sharpe_approx = max_dd > 0 ? (strategy.netprofit / strategy.initial_capital) / (max_dd / 100) : 0.0
+    
+    // Win Rate
+    float win_rate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    
+    // Avg Win/Loss Ratio
+    float win_loss_ratio = strategy.grossloss > 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0.0
+    
+    // Display critical metrics
+    var table perf_table = table.new(position.top_right, 2, 5, border_width=2)
+    table.cell(perf_table, 0, 0, "Win Rate", bgcolor=color.new(color.blue, 80), text_color=color.white)
+    table.cell(perf_table, 1, 0, str.tostring(win_rate, "#.#") + "%", text_color=color.white)
+    table.cell(perf_table, 0, 1, "Max DD", bgcolor=color.new(color.red, 80), text_color=color.white)
+    table.cell(perf_table, 1, 1, str.tostring(max_dd, "#.#") + "%", text_color=color.white)
+    table.cell(perf_table, 0, 2, "Sharpe~", bgcolor=color.new(color.green, 80), text_color=color.white)
+    table.cell(perf_table, 1, 2, str.tostring(sharpe_approx, "#.##"), text_color=color.white)
+    table.cell(perf_table, 0, 3, "Avg W/L", bgcolor=color.new(color.yellow, 80), text_color=color.black)
+    table.cell(perf_table, 1, 3, str.tostring(win_loss_ratio, "#.##"), text_color=color.white)
+    table.cell(perf_table, 0, 4, "Total Trades", bgcolor=color.new(color.purple, 80), text_color=color.white)
+    table.cell(perf_table, 1, 4, str.tostring(strategy.closedtrades), text_color=color.white)
+

@@ -1,0 +1,933 @@
+//@version=6
+strategy("Gann Fan Optimizer v2 (Strategy)", overlay=true, shorttitle="Gann-Pro Strat", max_lines_count=500, max_labels_count=500, max_boxes_count=500, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// =============================================================================
+// 1. TYPES
+// =============================================================================
+type PivotCandidate
+    float price
+    int   idx
+    float score   
+    float vol     
+
+type AnchorPoint
+    float price
+    int   idx
+    float vol
+    bool  confirmed
+
+type Regime
+    int   direction // 1 = Bullish, -1 = Bearish
+    float volatility // Current ATR or Vol measure
+    bool  isTrending // True if price is significantly away from EMA
+
+type SignalEvent
+    string id       // e.g., "L1", "Tier1"
+    int    idx      // Bar index
+    float  price
+    string sType    // "Long", "Short", "Exit"
+
+type ProfileStats
+    float poc
+    float vah
+    float val
+
+// =============================================================================
+// 2. INPUTS
+// =============================================================================
+
+// GROUP 1: Trading Style
+tradingStyle = input.string("Swing Trading", "Trading Style", options=["Scalping", "Day Trading", "Swing Trading", "Position Trading"], tooltip="Scalping: 1m-15m | Day: 15m-4H | Swing: 4H-Daily | Position: Daily-Weekly", group="SIMPLE SETUP")
+
+// GROUP 2: Signal Sensitivity
+signalMode = input.string("Balanced", "Signal Sensitivity", options=["Conservative", "Balanced", "Aggressive"], tooltip="Conservative: L1/H1 only | Balanced: L1/L2/H1/H2 | Aggressive: All signals", group="SIMPLE SETUP")
+
+// GROUP 3: Visual Display
+visualMode = input.string("Clean", "Visual Display", options=["Minimal", "Clean", "Detailed"], tooltip="Minimal: Fans only | Clean: Fans + Key Levels | Detailed: All visuals", group="SIMPLE SETUP")
+showVP_Hist = input.bool(true, "Show VP Histogram", group="SIMPLE SETUP")
+
+// GROUP 4: Market Type
+marketType = input.string("Auto-Detect", "Market Type", options=["Auto-Detect", "Crypto (24/7)", "Forex (24/5)", "Stocks (Market Hours)"], group="SIMPLE SETUP")
+
+// BACKTEST RANGE
+useDateFilter = input.bool(true, "Filter Date Range", group="BACKTEST RANGE")
+startDate = input.time(timestamp("1 Jan 2023 00:00"), "Start Date", group="BACKTEST RANGE")
+endDate = input.time(timestamp("1 Jan 2030 00:00"), "End Date", group="BACKTEST RANGE")
+
+// EXPERT MODE
+showExpert = input.bool(false, "Show Expert Settings", group="EXPERT MODE")
+expertSlope = input.string("Auto", "Slope Calculation", options=["Auto", "Geometry", "Trend", "Volatility", "Manual"], group="EXPERT MODE")
+expertSlopeManual = input.float(0.9, "Manual Slope Multiplier", group="EXPERT MODE")
+expertFilterMode = input.string("Auto", "Filter Strength", options=["Auto", "Strict", "Moderate", "None"], group="EXPERT MODE")
+
+// RISK MANAGEMENT
+grp_risk = "Risk Management"
+useTrailingStop = input.bool(true, "Use Trailing Stop", group=grp_risk)
+trailingStopATR = input.float(3.0, "Trailing Stop ATR Multiplier", step=0.1, group=grp_risk)
+trailingStopActivation = input.float(2.0, "Activation ATR Multiplier", step=0.1, group=grp_risk, tooltip="Profit must reach this * ATR to activate trailing stop")
+usePartialTP = input.bool(true, "Use Partial Take Profit", group=grp_risk)
+partialTPQty = input.float(50, "Partial TP %", minval=1, maxval=99, step=1, group=grp_risk)
+partialTPTarget = input.float(2.0, "Partial TP ATR Target", step=0.1, group=grp_risk)
+minATRFilter = input.float(0.0, "Min ATR Filter (0 to disable)", step=0.1, group=grp_risk)
+stopLossATRMult = input.float(2.0, "Fixed SL ATR Multiplier", minval=0.1, step=0.1, group=grp_risk)
+takeProfitATRMult = input.float(3.0, "Fixed TP ATR Multiplier", minval=0.1, step=0.1, group=grp_risk)
+riskRewardRatio = input.float(1.5, "Fixed Risk/Reward Ratio", minval=0.5, step=0.1, group=grp_risk)
+
+// FUSION SCORING (Cipher Integration)
+grp_fusion = "Fusion Scoring Engine"
+useFusion = input.bool(true, "Use Fusion Scoring", group=grp_fusion)
+minConfluenceScore = input.float(0.6, "Min Confluence Score", minval=0.1, maxval=1.0, step=0.1, group=grp_fusion)
+wt_len1 = input.int(9, "WT Channel Length", group=grp_fusion)
+wt_len2 = input.int(12, "WT Average Length", group=grp_fusion)
+wt_smooth = input.int(3, "WT Smoothing", group=grp_fusion)
+
+// CIPHER B SETTINGS (Day Trading Enhancements)
+grp_cipher_b = "Cipher B Settings"
+useMFI = input.bool(true, "Use Money Flow (MFI)", group=grp_cipher_b)
+useSTC = input.bool(true, "Use Schaff Trend Cycle (STC)", group=grp_cipher_b)
+rsiMFIperiod = input.int(60, "MFI Period", group=grp_cipher_b)
+rsiMFIMultiplier = input.float(150, "MFI Multiplier", group=grp_cipher_b)
+tclength = input.int(10, "STC Length", group=grp_cipher_b)
+tcfastLength = input.int(23, "STC Fast Length", group=grp_cipher_b)
+tcslowLength = input.int(50, "STC Slow Length", group=grp_cipher_b)
+tcfactor = input.float(0.5, "STC Factor", group=grp_cipher_b)
+
+// Appearance
+grp_look = "🎨 Appearance"
+colBull = input.color(color.green, "Bull Fan Color", group=grp_look)
+colBear = input.color(color.red,   "Bear Fan Color", group=grp_look)
+colPOC  = input.color(color.orange,"POC Line Color", group=grp_look)
+
+// =============================================================================
+// 3. STORAGE
+// =============================================================================
+var PivotCandidate[] pDataArrayLow_fixed  = array.new<PivotCandidate>()
+var PivotCandidate[] pDataArrayHigh_fixed = array.new<PivotCandidate>()
+
+var float[] winPrices_Macro = array.new<float>() 
+var float[] winVols_Macro   = array.new<float>()
+var float[] winPrices_Micro = array.new<float>() 
+var float[] winVols_Micro   = array.new<float>()
+
+var line[] fanLines = array.new<line>()
+var label[] fanLabels = array.new<label>()
+var line[] vpLines = array.new<line>()
+var table statusTable = table.new(position.bottom_right, 2, 8, border_width=1)
+
+var float winMaxPrice = -1.0e10
+var float winMinPrice = 1.0e10
+var int winBarCount = 0
+
+// Market Regime State
+var Regime marketRegime = Regime.new(0, 0.0, false)
+
+// Signal Caching
+var SignalEvent[] signalCache = array.new<SignalEvent>()
+
+// Fixed Anchors
+var AnchorPoint l1 = AnchorPoint.new(na, na, na, false)
+var AnchorPoint l2 = AnchorPoint.new(na, na, na, false)
+var AnchorPoint l3 = AnchorPoint.new(na, na, na, false)
+var AnchorPoint h1 = AnchorPoint.new(na, na, na, false)
+var AnchorPoint h2 = AnchorPoint.new(na, na, na, false)
+var AnchorPoint h3 = AnchorPoint.new(na, na, na, false)
+
+// Alert/Trigger flags
+var bool triggerLong = false
+var bool triggerShort = false
+var bool triggerExitLong = false
+var bool triggerExitShort = false
+
+// =============================================================================
+// 4. PRESET LOGIC
+// =============================================================================
+
+var int c_lookback = na
+var int c_pivot = na
+var int c_minDist = na
+var int c_vpRows = na
+var float c_slope = na
+var bool c_showL3H3 = false
+var bool c_showExit = false
+var bool c_useRSI = true
+var bool c_useVWAP = true
+var bool c_useCE = true
+var bool c_showVP = false
+var bool c_showIndicators = false
+var bool c_showHalves = true
+var bool c_showThirds = false
+var bool c_showConfluence = false
+
+if tradingStyle == "Scalping"
+    c_lookback := 300
+    c_pivot := 5
+    c_minDist := 15
+    c_vpRows := 30
+    c_slope := 0.7
+else if tradingStyle == "Day Trading"
+    c_lookback := 600
+    c_pivot := 10
+    c_minDist := 30
+    c_vpRows := 50
+    c_slope := 0.85
+else if tradingStyle == "Swing Trading"
+    c_lookback := 1200
+    c_pivot := 20
+    c_minDist := 60
+    c_vpRows := 80
+    c_slope := 1.0
+else // Position Trading
+    c_lookback := 2500
+    c_pivot := 40
+    c_minDist := 120
+    c_vpRows := 120
+    c_slope := 1.2
+
+if signalMode == "Conservative"
+    c_showL3H3 := false
+    c_showExit := false
+    c_useRSI := true
+    c_useVWAP := true
+    c_useCE := true
+else if signalMode == "Balanced"
+    c_showL3H3 := false
+    c_showExit := true
+    c_useRSI := true
+    c_useVWAP := true
+    c_useCE := false
+else // Aggressive
+    c_showL3H3 := true
+    c_showExit := true
+    c_useRSI := false
+    c_useVWAP := false
+    c_useCE := false
+
+if visualMode == "Minimal"
+    c_showVP := false
+    c_showIndicators := false
+    c_showHalves := false
+    c_showThirds := false
+    c_showConfluence := false
+else if visualMode == "Clean"
+    c_showVP := true
+    c_showIndicators := false
+    c_showHalves := true
+    c_showThirds := false
+    c_showConfluence := true
+else // Detailed
+    c_showVP := true
+    c_showIndicators := true
+    c_showHalves := true
+    c_showThirds := true
+    c_showConfluence := true
+
+if marketType == "Crypto (24/7)"
+    c_slope := c_slope * 0.9
+else if marketType == "Forex (24/5)"
+    c_slope := c_slope * 0.95
+else if marketType == "Stocks (Market Hours)"
+    c_slope := c_slope * 1.05
+
+string finalSlopeMode = showExpert and expertSlope != "Auto" ? expertSlope : "Geometry"
+if showExpert and expertFilterMode != "Auto"
+    if expertFilterMode == "Strict"
+        c_useRSI := true
+        c_useVWAP := true
+        c_useCE := true
+    else if expertFilterMode == "Moderate"
+        c_useRSI := true
+        c_useVWAP := true
+        c_useCE := false
+    else // None
+        c_useRSI := false
+        c_useVWAP := false
+        c_useCE := false
+
+// Date Filter Check
+bool inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// =============================================================================
+// 5. HELPER FUNCTIONS
+// =============================================================================
+
+clearGraphics() =>
+    if array.size(fanLines) > 0
+        for i = 0 to array.size(fanLines) - 1
+            line.delete(array.get(fanLines, i))
+        array.clear(fanLines)
+    if array.size(fanLabels) > 0
+        for i = 0 to array.size(fanLabels) - 1
+            label.delete(array.get(fanLabels, i))
+        array.clear(fanLabels)
+    if array.size(vpLines) > 0
+        for i = 0 to array.size(vpLines) - 1
+            line.delete(array.get(vpLines, i))
+        array.clear(vpLines)
+
+isFarEnough(int newIdx, int existingIdx, int minDist) => 
+    na(existingIdx) or math.abs(newIdx - existingIdx) >= minDist
+
+getTFRatio() =>
+    float currentTFInSeconds = timeframe.in_seconds()
+    float dayInSeconds = 86400.0 
+    float ratio = currentTFInSeconds > 0 ? dayInSeconds / currentTFInSeconds : 1.0
+    math.max(ratio, 1.0)
+
+getSlopeBias(Regime r, float fanDir) =>
+    float bias = 1.0
+    if r.direction == 1 // Bullish
+        bias := fanDir > 0 ? 0.9 : 1.1
+    else if r.direction == -1 // Bearish
+        bias := fanDir > 0 ? 1.1 : 0.9
+    bias
+
+checkFanSignal(float src, float fanPrice, bool isLong, float atrVal) =>
+    float buffer = atrVal * 0.2
+    bool sig = false
+    if isLong
+        sig := src > (fanPrice + buffer)
+    else
+        sig := src < (fanPrice - buffer)
+    sig
+
+checkConfluence(float fanPrice, float poc, float atrVal, bool isLong, float o, float c, float h, float l) =>
+    bool isNearPOC = false
+    if not na(poc)
+        isNearPOC := math.abs(fanPrice - poc) < (atrVal * 0.5)
+    bool isReversal = false
+    if isLong
+        isReversal := c > o and (l < fanPrice or (not na(poc) and l < poc)) and c > fanPrice
+    else
+        isReversal := c < o and (h > fanPrice or (not na(poc) and h > poc)) and c < fanPrice
+    isNearPOC and isReversal
+
+checkExit(float c, float fanPrice, bool isLong) =>
+    bool exit = false
+    if isLong
+        exit := c < fanPrice
+    else
+        exit := c > fanPrice
+    exit
+
+getRegime(float src, float emaVal, float atrVal) =>
+    int dir = src > emaVal ? 1 : -1
+    bool trending = math.abs(src - emaVal) > (atrVal * 0.5)
+    Regime.new(dir, atrVal, trending)
+
+// --- FUSION HELPER FUNCTIONS ---
+f_wavetrend(_src, _chlen, _avg, _smth) =>
+    _esa = ta.ema(_src, _chlen)
+    _de  = ta.ema(math.abs(_src - _esa), _chlen)
+    _ci  = (_src - _esa) / (0.015 * math.max(_de, 0.000001))
+    _tci = ta.ema(_ci, _avg)
+    _wt1 = _tci
+    _wt2 = ta.sma(_wt1, _smth)
+    [_wt1, _wt2]
+
+f_getFlowState(float _close) =>
+    _ema2 = ta.ema(_close, 11)
+    _ema8 = ta.ema(_close, 34)
+    _cloud_fast = ta.ema(_close, 55)
+    _cloud_slow = ta.ema(_close, 200)
+    
+    bool ribbon_bull = _ema2 > _ema8
+    bool ribbon_bear = _ema2 < _ema8
+    bool cloud_bull  = _close > _cloud_fast and _cloud_fast > _cloud_slow
+    bool cloud_bear  = _close < _cloud_fast and _cloud_fast < _cloud_slow
+    
+    int state = 0
+    if ribbon_bull and cloud_bull
+        state := 1
+    else if ribbon_bear and cloud_bear
+        state := -1
+    state
+
+// MFI (Body Range Ratio)
+f_bodyRangeRatio(_period, _multiplier) => 
+    ta.sma(((close - open) / math.max(high - low, 0.000001)) * _multiplier, _period)
+
+// Schaff Trend Cycle
+f_tc(src, length, fastLength, slowLength, factor) =>
+    ema1 = ta.ema(src, fastLength)
+    ema2 = ta.ema(src, slowLength)
+    macdVal = ema1 - ema2	
+    alpha = ta.lowest(macdVal, length)
+    beta = ta.highest(macdVal, length) - alpha
+    gamma = (macdVal - alpha) / beta * 100
+    gamma := beta > 0 ? gamma : nz(gamma[1])
+    delta = gamma
+    delta := na(delta[1]) ? delta : delta[1] + factor * (gamma - delta[1])
+    epsilon = ta.lowest(delta, length)
+    zeta = ta.highest(delta, length) - epsilon
+    eta = (delta - epsilon) / zeta * 100
+    eta := zeta > 0 ? eta : nz(eta[1])
+    stcReturn = eta
+    stcReturn := na(stcReturn[1]) ? stcReturn : stcReturn[1] + factor * (eta - stcReturn[1])
+    stcReturn
+
+drawFanLine(int idx, float price, float baseSlope, float mult, float direction, color c, int w, string st) =>
+    line.new(idx, price, idx + 10, price + (baseSlope * mult * 10 * direction), color=c, width=w, style=st, extend=extend.right)
+
+drawAnchorMarker(AnchorPoint ap, color col) =>
+    if not na(ap.idx)
+        lbl = label.new(ap.idx, ap.price, "", xloc=xloc.bar_index, style=label.style_circle, size=size.tiny, color=col, textcolor=col)
+        array.push(fanLabels, lbl)
+
+drawFan(int idx, float price, float pVol, color col, bool show, float fallbackVol, float boxSlope, float direction, string lblText, float pocMacro, float pocMicro, Regime reg) =>
+    // Ensure we have valid anchor data before drawing to avoid missing fan lines
+    if show and not na(idx) and not na(price) and not na(direction)
+        float baseSlope = 0.0
+        if finalSlopeMode == "Geometry" or finalSlopeMode == "Trend"
+            baseSlope := boxSlope * c_slope
+        else if finalSlopeMode == "Volatility"
+            float volToUse = na(pVol) ? fallbackVol : pVol
+            baseSlope := volToUse * c_slope
+        else if finalSlopeMode == "Manual"
+            float tRatio = getTFRatio()
+            baseSlope := (expertSlopeManual / tRatio) * c_slope
+        else 
+            baseSlope := boxSlope * c_slope
+
+        // Apply regime bias to reduce false signals in choppy markets
+        float biasMult = getSlopeBias(reg, direction)
+        baseSlope := baseSlope * biasMult
+
+        // Main 1x line
+        array.push(fanLines, drawFanLine(idx, price, baseSlope, 1.0, direction, col, 2, line.style_solid))
+        
+        // Anchor label for quick visual reference
+        lbl = label.new(idx, price, lblText, xloc=xloc.bar_index, style=label.style_label_left, size=size.tiny, color=col, textcolor=color.white)
+        array.push(fanLabels, lbl)
+
+        // Optional half-line visualisation (lighter opacity)
+        if c_showHalves
+            array.push(fanLines, drawFanLine(idx, price, baseSlope, 2.0, direction, color.new(col, 20), 1, line.style_solid))
+            array.push(fanLines, drawFanLine(idx, price, baseSlope, 0.5, direction, color.new(col, 20), 1, line.style_solid))
+
+        // Optional third-line visualisation (dashed)
+        if c_showThirds
+            array.push(fanLines, drawFanLine(idx, price, baseSlope, 3.0, direction, color.new(col, 40), 1, line.style_dashed))
+            array.push(fanLines, drawFanLine(idx, price, baseSlope, 0.333, direction, color.new(col, 40), 1, line.style_dashed))
+
+findNextAnchor(AnchorPoint exclude1, AnchorPoint exclude2, float[] scores, PivotCandidate[] calcData, bool[] used, int minDist) =>
+    AnchorPoint res = AnchorPoint.new(na, na, na, false)
+    if array.size(scores) > 0
+        for s = 0 to array.size(scores) - 1
+            float tScore = array.get(scores, s)
+            for c = 0 to array.size(calcData) - 1
+                if not array.get(used, c)
+                    PivotCandidate cand = array.get(calcData, c)
+                    if math.abs(cand.score - tScore) < 1e-5
+                        bool d1 = isFarEnough(cand.idx, exclude1.idx, minDist)
+                        bool d2 = isFarEnough(cand.idx, exclude2.idx, minDist)
+                        if d1 and d2
+                            res.price := cand.price
+                            res.idx   := cand.idx
+                            res.vol   := cand.vol
+                            res.confirmed := true
+                            array.set(used, c, true)
+                        break
+            if not na(res.idx)
+                break
+    res
+
+boostScores(PivotCandidate[] arr, float poc, float vah, float val, float rangeP, string mode, string fMode, float avgVol) =>
+    if not na(poc) and array.size(arr) > 0
+        float maxBoost = 0.5 
+        float vWeight = 20.0 
+        
+        int arrSize = array.size(arr)
+        for i = 0 to arrSize - 1
+            PivotCandidate c = array.get(arr, i)
+            
+            float dist = 0.0
+            if fMode == "Center (POC)"
+                dist := math.abs(c.price - poc)
+            else
+                float distH = math.abs(c.price - vah)
+                float distL = math.abs(c.price - val)
+                dist := math.min(distH, distL)
+            
+            float normDist = dist / (rangeP == 0 ? 1 : rangeP)
+            float volBoost = 0.0
+            if vWeight > 0 and avgVol > 0
+                volBoost := (c.vol / avgVol) * (vWeight / 100.0)
+
+            float totalMult = 1.0 + (volBoost * maxBoost)
+            if normDist < 0.2
+                totalMult := totalMult * (1.0 + (0.2 - normDist)) 
+            
+            c.score := c.score * totalMult
+            array.set(arr, i, c)
+
+getProfileStats(float[] prices, float[] vols, float minP, float maxP, int rows, float valPct, bool filterNoise, float avgVol) =>
+    ProfileStats stats = ProfileStats.new(na, na, na)
+    if array.size(prices) > 0
+        float rangeSize = maxP - minP
+        float rowSize = rangeSize / rows
+        if rowSize > 0
+            float[] buckets = array.new<float>(rows, 0.0)
+            float totalVol = 0.0
+            int limit = array.size(prices)
+            for i = 0 to limit - 1
+                float p = array.get(prices, i)
+                float v = array.get(vols, i)
+                if not filterNoise or (v > (avgVol * 0.2))
+                    int idx = math.floor((p - minP) / rowSize)
+                    idx := math.min(idx, rows - 1)
+                    idx := math.max(idx, 0)
+                    array.set(buckets, idx, array.get(buckets, idx) + v)
+                    totalVol += v
+            int maxIdx = 0
+            float maxV = 0.0
+            for j = 0 to rows - 1
+                float bv = array.get(buckets, j)
+                if bv > maxV
+                    maxV := bv
+                    maxIdx := j
+            stats.poc := minP + (maxIdx * rowSize) + (rowSize / 2)
+            float targetVA = totalVol * (valPct / 100.0)
+            float currentVA = maxV
+            int upIdx = maxIdx
+            int dnIdx = maxIdx
+            while currentVA < targetVA
+                float upVol = (upIdx < rows - 1) ? array.get(buckets, upIdx + 1) : 0.0
+                float dnVol = (dnIdx > 0) ? array.get(buckets, dnIdx - 1) : 0.0
+                if upVol == 0.0 and dnVol == 0.0
+                    break
+                if upVol >= dnVol
+                    upIdx += 1
+                    currentVA += upVol
+                else
+                    dnIdx -= 1
+                    currentVA += dnVol
+            stats.vah := minP + (upIdx * rowSize)
+            stats.val := minP + (dnIdx * rowSize)
+    stats
+
+// =============================================================================
+// 6. MAIN LOGIC
+// =============================================================================
+
+var saved_style = tradingStyle
+var saved_signal = signalMode
+var saved_visual = visualMode
+bool resetNeeded = (tradingStyle != saved_style) or (signalMode != saved_signal) or (visualMode != saved_visual)
+
+if resetNeeded or bar_index == 0
+    array.clear(pDataArrayLow_fixed)
+    array.clear(pDataArrayHigh_fixed)
+    array.clear(winPrices_Macro)
+    array.clear(winVols_Macro)
+    array.clear(winPrices_Micro)
+    array.clear(winVols_Micro)
+    winMaxPrice := -1.0e10
+    winMinPrice := 1.0e10
+    winBarCount := 0
+    saved_style := tradingStyle
+    saved_signal := signalMode
+    saved_visual := visualMode
+
+// Heikin Ashi Calculation
+float haClose = (open + high + low + close) / 4
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2 : (haOpen[1] + haClose[1]) / 2
+float haHigh = math.max(high, math.max(haOpen, haClose))
+float haLow = math.min(low, math.min(haOpen, haClose))
+
+float srcLow  = haLow
+float srcHigh = haHigh
+float srcVol  = volume
+
+// [FIX 1] Calculate ATR consistently on every bar
+float calcATR = ta.atr(14)
+float useATR = na(calcATR) ? 0.0 : calcATR
+
+// Indicators
+float fastMA = ta.ema(close, 12)
+float slowMA = ta.ema(close, 26)
+float macd   = fastMA - slowMA
+float signal_line = ta.ema(macd, 9)
+
+bool x_std_long  = ta.crossover(macd, signal_line)
+bool x_std_short = ta.crossunder(macd, signal_line)
+
+float rsiVal = ta.rsi(close, 14)
+float vwapVal = ta.vwap(close)
+float ema50 = ta.ema(close, 50)
+float avgVolRecent = ta.sma(volume, 100)
+
+// Chandelier Exit
+float ceATR = ta.atr(22)
+float ceHighest = ta.highest(high, 22)
+float ceLowest  = ta.lowest(low, 22)
+var float ceLongStop = na
+var float ceShortStop = na
+var int ceDir = 1
+
+float ceTempLong = ceHighest - (ceATR * 3.0)
+float ceTempShort = ceLowest + (ceATR * 3.0)
+
+if not na(ceLongStop[1]) and not na(close[1])
+    ceLongStop := close[1] > ceLongStop[1] ? math.max(ceTempLong, ceLongStop[1]) : ceTempLong
+else
+    ceLongStop := ceTempLong
+
+if not na(ceShortStop[1]) and not na(close[1])
+    ceShortStop := close[1] < ceShortStop[1] ? math.min(ceTempShort, ceShortStop[1]) : ceTempShort
+else
+    ceShortStop := ceTempShort
+
+if not na(ceShortStop[1]) and close > ceShortStop[1]
+    ceDir := 1
+else if not na(ceLongStop[1]) and close < ceLongStop[1]
+    ceDir := -1
+
+// Pivot Scanning
+int k = c_pivot
+int l = c_pivot
+pLow  = ta.pivotlow(srcLow, k, l)
+pHigh = ta.pivothigh(srcHigh, k, l)
+pIndex = bar_index - l
+
+float highestInLookback = ta.highest(srcHigh, k)
+float lowestInLookback  = ta.lowest(srcLow, k)
+float maxVolRecent      = ta.highest(srcVol, 100)
+
+int estimatedTimeDelta = c_lookback * timeframe.in_seconds() * 1000
+int autoStartTime = timenow - estimatedTimeDelta
+bool inWindow = time >= autoStartTime
+bool inMicro = time >= (timenow - (estimatedTimeDelta / 2))
+
+if inWindow
+    winMaxPrice := math.max(winMaxPrice, srcHigh)
+    winMinPrice := math.min(winMinPrice, srcLow)
+    winBarCount += 1
+    
+    if bar_index % 2 == 0
+        array.push(winPrices_Macro, (srcHigh + srcLow) / 2)
+        array.push(winVols_Macro, srcVol)
+        if inMicro
+            array.push(winPrices_Micro, (srcHigh + srcLow) / 2)
+            array.push(winVols_Micro, srcVol)
+
+    float pivotATR = useATR
+    float volFactor = (srcVol / (maxVolRecent == 0 ? 1 : maxVolRecent))
+
+    if barstate.isconfirmed
+        if not na(pLow)
+            float scoreLow = volFactor * (highestInLookback - pLow)
+            array.push(pDataArrayLow_fixed, PivotCandidate.new(pLow, pIndex, scoreLow, pivotATR))
+            if array.size(pDataArrayLow_fixed) > 50
+                array.shift(pDataArrayLow_fixed)
+
+        if not na(pHigh)
+            float scoreHigh = volFactor * (pHigh - lowestInLookback)
+            array.push(pDataArrayHigh_fixed, PivotCandidate.new(pHigh, pIndex, scoreHigh, pivotATR))
+            if array.size(pDataArrayHigh_fixed) > 50
+                array.shift(pDataArrayHigh_fixed)
+
+bgcolor(inWindow ? color.new(color.yellow, 95) : na, title="Search Zone")
+
+// =============================================================================
+// 7. EXECUTION (ANCHORS & STRATEGY SIGNALS)
+// =============================================================================
+
+var ProfileStats macroStats = na
+var ProfileStats microStats = na
+
+// Reset triggers
+triggerLong := false
+triggerShort := false
+triggerExitLong := false
+triggerExitShort := false
+string entryLabel = ""
+
+// Anchor Updates (Confirmed Only)
+if barstate.isconfirmed
+    bool isDataLoaded = array.size(winPrices_Macro) > 0
+    if isDataLoaded
+        macroStats := getProfileStats(winPrices_Macro, winVols_Macro, winMinPrice, winMaxPrice, c_vpRows, 70.0, false, avgVolRecent)
+        microStats := getProfileStats(winPrices_Micro, winVols_Micro, winMinPrice, winMaxPrice, c_vpRows, 70.0, false, avgVolRecent)
+
+        float rangeP = winMaxPrice - winMinPrice
+        boostScores(pDataArrayLow_fixed, macroStats.poc, macroStats.vah, macroStats.val, rangeP, "Swing Strength", "Center (POC)", avgVolRecent)
+        boostScores(pDataArrayHigh_fixed, macroStats.poc, macroStats.vah, macroStats.val, rangeP, "Swing Strength", "Center (POC)", avgVolRecent)
+
+        PivotCandidate[] cLow = array.copy(pDataArrayLow_fixed)
+        float[] sLow = array.new<float>()
+        if array.size(cLow) > 0
+            for i = 0 to array.size(cLow) - 1
+                array.push(sLow, array.get(cLow, i).score)
+            array.sort(sLow, order.descending)
+        bool[] uLow = array.new_bool(array.size(cLow), false)
+        l1 := findNextAnchor(AnchorPoint.new(na,na,na,true), AnchorPoint.new(na,na,na,true), sLow, cLow, uLow, c_minDist)
+        l2 := findNextAnchor(l1, AnchorPoint.new(na,na,na,true), sLow, cLow, uLow, c_minDist)
+        l3 := findNextAnchor(l1, l2, sLow, cLow, uLow, c_minDist)
+
+        PivotCandidate[] cHigh = array.copy(pDataArrayHigh_fixed)
+        float[] sHigh = array.new<float>()
+        if array.size(cHigh) > 0
+            for i = 0 to array.size(cHigh) - 1
+                array.push(sHigh, array.get(cHigh, i).score)
+            array.sort(sHigh, order.descending)
+        bool[] uHigh = array.new_bool(array.size(cHigh), false)
+        h1 := findNextAnchor(AnchorPoint.new(na,na,na,true), AnchorPoint.new(na,na,na,true), sHigh, cHigh, uHigh, c_minDist)
+        h2 := findNextAnchor(h1, AnchorPoint.new(na,na,na,true), sHigh, cHigh, uHigh, c_minDist)
+        h3 := findNextAnchor(h1, h2, sHigh, cHigh, uHigh, c_minDist)
+
+// Real-time Signal Logic
+float safeBars = math.max(winBarCount, 1)
+float calculatedBoxSlope = (winMaxPrice - winMinPrice) / safeBars
+float slopeVal = calculatedBoxSlope * c_slope
+
+// Update Regime for Current Bar
+marketRegime := getRegime(close, ema50, useATR)
+
+float biasLong = getSlopeBias(marketRegime, 1.0)
+float biasShort = getSlopeBias(marketRegime, -1.0)
+float slopeLong = slopeVal * biasLong
+float slopeShort = slopeVal * biasShort
+
+int i = bar_index
+bool rsiLongOk = not c_useRSI or rsiVal < 70
+bool rsiShortOk = not c_useRSI or rsiVal > 30
+bool vwapLong = not c_useVWAP or close > vwapVal
+bool vwapShort = not c_useVWAP or close < vwapVal
+bool ceLongOk = not c_useCE or ceDir == 1
+bool ceShortOk = not c_useCE or ceDir == -1
+
+// Calculate Fusion Components
+[wt1, wt2] = f_wavetrend(hlc3, wt_len1, wt_len2, wt_smooth)
+int s_wave = wt1 > wt2 ? 1 : -1
+int s_flow = f_getFlowState(close)
+int s_vp   = close > vwapVal ? 1 : -1
+int s_gann = marketRegime.direction // Use regime as the background Gann bias
+
+// Cipher B Components
+float mfiVal = f_bodyRangeRatio(rsiMFIperiod, rsiMFIMultiplier)
+float stcVal = f_tc(close, tclength, tcfastLength, tcslowLength, tcfactor)
+
+int s_mfi = mfiVal > 0 ? 1 : -1
+int s_stc = stcVal > 25 ? (stcVal > 75 ? 1 : 0) : -1 // Bullish > 75, Bearish < 25, Neutral in between
+
+// Calculate Confluence Score (-1.0 to 1.0)
+// Weights: Wave(0.3) + Flow(0.2) + Gann(0.2) + VP(0.1) + MFI(0.1) + STC(0.1)
+float confluenceScore = (s_wave * 0.3) + (s_flow * 0.2) + (s_gann * 0.2) + (s_vp * 0.1)
+if useMFI
+    confluenceScore += (s_mfi * 0.1)
+if useSTC
+    confluenceScore += (s_stc * 0.1)
+
+// Gold Dot Logic (High Probability Reversal)
+bool goldDotBuy = wt2 <= -53 and mfiVal < -5 and stcVal < 20 and wt1 > wt2
+bool goldDotSell = wt2 >= 53 and mfiVal > 5 and stcVal > 80 and wt1 < wt2
+
+// Boost Score for Gold Dots
+if goldDotBuy
+    confluenceScore += 0.3
+if goldDotSell
+    confluenceScore -= 0.3
+
+// Calculate Dynamic Trailing Values (in ticks)
+float atrTick = useATR / syminfo.mintick
+float trailOffsetTicks = trailingStopATR * atrTick
+float trailActivationTicks = trailingStopActivation * atrTick
+
+// Calculate Partial TP Price
+float longPartialTP = close + (partialTPTarget * useATR)
+float shortPartialTP = close - (partialTPTarget * useATR)
+
+// Calculate Strategy Signals on CONFIRMED bar to ensure no repainting in strategy tester
+if barstate.isconfirmed and inDateRange
+    // Global Filter Check
+    bool atrFilterOk = minATRFilter == 0.0 or useATR > minATRFilter
+    bool fusionOkLong = not useFusion or confluenceScore >= minConfluenceScore
+    bool fusionOkShort = not useFusion or confluenceScore <= -minConfluenceScore
+    
+    // God Mode Override (Strong Signal ignores minor filters)
+    if useFusion and math.abs(confluenceScore) >= 0.8
+        atrFilterOk := true // Force entry on God Mode
+
+    // L1/L2
+    if x_std_long and rsiLongOk and vwapLong and ceLongOk and atrFilterOk and fusionOkLong
+        if not na(l1.idx) and i > l1.idx
+            float fanPrice = l1.price + (slopeLong * 1.0 * (i - l1.idx))
+            if checkFanSignal(close, fanPrice, true, useATR)
+                bool isTier1 = checkConfluence(fanPrice, macroStats.poc, useATR, true, open, close, high, low)
+                string sId = isTier1 ? "★ L1" : "L1"
+                array.push(signalCache, SignalEvent.new(sId, i, low, "Long"))
+                triggerLong := true
+                entryLabel := sId
+
+    // L3
+    if c_showL3H3 and x_std_long and rsiLongOk and vwapLong and ceLongOk
+        if not na(l3.idx) and i > l3.idx
+            float fanPrice = l3.price + (slopeLong * 1.0 * (i - l3.idx))
+            if checkFanSignal(close, fanPrice, true, useATR)
+                array.push(signalCache, SignalEvent.new("L3", i, low, "Long"))
+                if not triggerLong // Prioritize L1
+                    triggerLong := true
+                    entryLabel := "L3"
+
+    // H1/H2
+    if x_std_short and rsiShortOk and vwapShort and ceShortOk
+        if not na(h1.idx) and i > h1.idx
+            float fanPrice = h1.price + (slopeShort * -1.0 * (i - h1.idx))
+            if checkFanSignal(close, fanPrice, false, useATR)
+                bool isTier1 = checkConfluence(fanPrice, macroStats.poc, useATR, false, open, close, high, low)
+                string sId = isTier1 ? "★ S1" : "S1"
+                array.push(signalCache, SignalEvent.new(sId, i, high, "Short"))
+                triggerShort := true
+                entryLabel := sId
+
+    // H3
+    if c_showL3H3 and x_std_short and rsiShortOk and vwapShort and ceShortOk and atrFilterOk and fusionOkShort
+        if not na(h3.idx) and i > h3.idx
+            float fanPrice = h3.price + (slopeShort * -1.0 * (i - h3.idx))
+            if checkFanSignal(close, fanPrice, false, useATR)
+                array.push(signalCache, SignalEvent.new("S3", i, high, "Short"))
+                if not triggerShort
+                    triggerShort := true
+                    entryLabel := "S3"
+
+    // Exits
+    if c_showExit
+        // Long exit
+        if not na(l1.idx) and i > l1.idx
+            float fanPriceLong = l1.price + slopeLong * 1.0 * (i - l1.idx)
+            if checkExit(close, fanPriceLong, true)
+                array.push(signalCache, SignalEvent.new("Exit L", i, low, "Exit"))
+                triggerExitLong := true
+        // Short exit
+        if not na(h1.idx) and i > h1.idx
+            float fanPriceShort = h1.price + slopeShort * -1.0 * (i - h1.idx)
+            if checkExit(close, fanPriceShort, false)
+                array.push(signalCache, SignalEvent.new("Exit S", i, high, "Exit"))
+                triggerExitShort := true
+    
+    // Garbage collection
+    if array.size(signalCache) > 300
+        array.shift(signalCache)
+
+// --- STRATEGY ENTRY/EXIT EXECUTION ---
+// === ENTRY LOGIC WITH RISK MANAGEMENT ===
+if triggerLong
+    strategy.entry("Long", strategy.long, comment=entryLabel + " (Sc:" + str.tostring(confluenceScore, "#.##") + ")")
+    
+    // 1. Partial Take Profit
+    if usePartialTP
+        strategy.exit("Long Partial", "Long", qty_percent=partialTPQty, limit=longPartialTP, comment="Partial TP")
+    
+    // 2. Trailing Stop (activates after profit > activation, trails by offset)
+    if useTrailingStop
+        strategy.exit("Long Trail", "Long", trail_points=trailActivationTicks, trail_offset=trailOffsetTicks, comment="Trailing SL")
+    else
+        // Standard Fixed SL/TP if no trailing
+        strategy.exit("Long Fix", "Long", stop=close - stopLossATRMult * useATR, limit=close + math.max(takeProfitATRMult, stopLossATRMult * riskRewardRatio) * useATR, comment="Fixed TP/SL")
+
+if triggerShort
+    strategy.entry("Short", strategy.short, comment=entryLabel + " (Sc:" + str.tostring(confluenceScore, "#.##") + ")")
+
+    // 1. Partial Take Profit
+    if usePartialTP
+        strategy.exit("Short Partial", "Short", qty_percent=partialTPQty, limit=shortPartialTP, comment="Partial TP")
+
+    // 2. Trailing Stop
+    if useTrailingStop
+        strategy.exit("Short Trail", "Short", trail_points=trailActivationTicks, trail_offset=trailOffsetTicks, comment="Trailing SL")
+    else
+        strategy.exit("Short Fix", "Short", stop=close + stopLossATRMult * useATR, limit=close - math.max(takeProfitATRMult, stopLossATRMult * riskRewardRatio) * useATR, comment="Fixed TP/SL")
+
+// === EXIT LOGIC (manual fan exits) ===
+if triggerExitLong
+    strategy.close("Long", comment="Fan Exit")
+
+if triggerExitShort
+    strategy.close("Short", comment="Fan Exit")
+
+// =============================================================================
+// 8. VISUALIZATION
+// =============================================================================
+
+// [FIX 2] Explicitly using islast. Note: In a strategy with calc_on_every_tick=false, 
+// this updates on bar close. This is the desired behavior for strategy visuals.
+if barstate.islast
+    clearGraphics() 
+    
+    // Dashboard
+    table.clear(statusTable, 0, 0, 1, 7)
+    table.cell(statusTable, 0, 0, "Gann Pro", bgcolor=color.new(color.gray, 90), text_size=size.small, text_color=color.white)
+    string styleShort = tradingStyle == "Scalping" ? "Scalp" : tradingStyle == "Day Trading" ? "Day" : tradingStyle == "Swing Trading" ? "Swing" : "Position"
+    table.cell(statusTable, 1, 0, styleShort, bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.small)
+    
+    string regimeStr = marketRegime.direction == 1 ? "Bullish" : "Bearish"
+    color regimeColor = marketRegime.direction == 1 ? color.green : color.red
+    table.cell(statusTable, 0, 1, regimeStr, bgcolor=color.new(regimeColor, 80), text_color=color.white, text_size=size.tiny)
+
+    // Draw Anchors
+    drawAnchorMarker(l1, colBull)
+    drawAnchorMarker(l2, colBull)
+    if c_showL3H3
+        drawAnchorMarker(l3, colBull)
+    drawAnchorMarker(h1, colBear)
+    drawAnchorMarker(h2, colBear)
+    if c_showL3H3
+        drawAnchorMarker(h3, colBear)
+
+    // Draw Fans
+    drawFan(l1.idx, l1.price, l1.vol, colBull, true, useATR, calculatedBoxSlope, 1.0, "L1", macroStats.poc, microStats.poc, marketRegime)
+    drawFan(l2.idx, l2.price, l2.vol, color.new(colBull, 0), true, useATR, calculatedBoxSlope, 1.0, "L2", macroStats.poc, microStats.poc, marketRegime)
+    if c_showL3H3
+        drawFan(l3.idx, l3.price, l3.vol, color.yellow, true, useATR, calculatedBoxSlope, 1.0, "L3", macroStats.poc, microStats.poc, marketRegime)
+    
+    drawFan(h1.idx, h1.price, h1.vol, colBear, true, useATR, calculatedBoxSlope, -1.0, "H1", macroStats.poc, microStats.poc, marketRegime)
+    drawFan(h2.idx, h2.price, h2.vol, color.maroon, true, useATR, calculatedBoxSlope, -1.0, "H2", macroStats.poc, microStats.poc, marketRegime)
+    if c_showL3H3
+        drawFan(h3.idx, h3.price, h3.vol, color.orange, true, useATR, calculatedBoxSlope, -1.0, "H3", macroStats.poc, microStats.poc, marketRegime)
+
+    // VP Levels
+    if showVP_Hist and c_showVP and not na(macroStats.poc)
+        array.push(vpLines, line.new(bar_index, macroStats.poc, bar_index + 10, macroStats.poc, color=colPOC, width=2, extend=extend.left))
+        array.push(vpLines, line.new(bar_index, macroStats.vah, bar_index + 10, macroStats.vah, color=color.new(color.blue, 50), extend=extend.left))
+        array.push(vpLines, line.new(bar_index, macroStats.val, bar_index + 10, macroStats.val, color=color.new(color.blue, 50), extend=extend.left))
+
+    // Draw Signal Labels (Visual only)
+    int lastDrawIdx = -1000
+    if array.size(signalCache) > 0
+        for s = 0 to array.size(signalCache) - 1
+            SignalEvent e = array.get(signalCache, s)
+            if e.idx > bar_index - 500
+                if e.idx - lastDrawIdx > 5
+                    color col = color.gray
+                    string style = label.style_label_up
+                    float yVal = e.price
+                    
+                    if e.sType == "Long"
+                        col := e.id == "★ L1" ? color.yellow : colBull
+                        style := label.style_label_up
+                        int lookback = bar_index - e.idx
+                        yVal := lookback >= 0 and lookback < 4999 ? low[lookback] : e.price
+                    else if e.sType == "Short"
+                        col := e.id == "★ S1" ? color.yellow : colBear
+                        style := label.style_label_down
+                        int lookback = bar_index - e.idx
+                        yVal := lookback >= 0 and lookback < 4999 ? high[lookback] : e.price
+                    else
+                        style := label.style_xcross
+                        int lookback = bar_index - e.idx
+                        if e.id == "Exit L"
+                            yVal := lookback >= 0 and lookback < 4999 ? low[lookback] : e.price
+                        else
+                            yVal := lookback >= 0 and lookback < 4999 ? high[lookback] : e.price
+
+                    lbl = label.new(e.idx, yVal, e.id, xloc=xloc.bar_index, color=col, style=style, textcolor=col == color.yellow ? color.black : color.white, size=size.tiny)
+                    array.push(fanLabels, lbl)
+                    lastDrawIdx := e.idx
+
+// =============================================================================
+// 9. PLOTS
+// =============================================================================
+plot(c_showIndicators ? vwapVal : na, "VWAP", color=color.new(color.blue, 30))
+plot(c_showIndicators ? ceLongStop : na, "CE Long Stop", color=color.lime, style=plot.style_linebr)
+plot(c_showIndicators ? ceShortStop : na, "CE Short Stop", color=color.red, style=plot.style_linebr)
